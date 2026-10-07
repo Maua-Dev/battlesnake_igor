@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Queue;
 
-public class GreenBettle {
+public class Logic {
 
     private static final int INFINITO = 1_000_000;
 
