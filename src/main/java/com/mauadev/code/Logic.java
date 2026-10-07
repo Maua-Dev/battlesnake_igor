@@ -54,6 +54,40 @@ public class Logic {
     public static void end(GameState state) {
     }
 
+    private static int distanciaParede(
+        GameState state,
+        Coordinate position
+    ) {
+
+        int esquerda =
+            position.getX();
+
+        int direita =
+            state.getBoard().getWidth()
+            - 1
+            - position.getX();
+
+        int baixo =
+            position.getY();
+
+        int cima =
+            state.getBoard().getHeight()
+            - 1
+            - position.getY();
+
+        return
+            Math.min(
+                Math.min(
+                    esquerda,
+                    direita
+                ),
+                Math.min(
+                    baixo,
+                    cima
+                )
+            );
+    }
+
     // =========================================================
     // DECISAO PRINCIPAL
     // =========================================================
@@ -199,6 +233,31 @@ public class Logic {
 
         if (isHazard(state, next)) {
             score -= 700;
+        }
+
+        // =====================================================
+        // PAREDE NO INICIO
+        // =====================================================
+
+        if (me.getLength() <= 7) {
+
+            int distanciaParede =
+                distanciaParede(
+                    state,
+                    next
+                );
+
+            /*
+            * Nao recompensa fugir para o centro.
+            * A borda e uma regiao perfeitamente valida
+            * para uma cobra pequena.
+            */
+            if (distanciaParede == 0) {
+                score += 120;
+
+            } else if (distanciaParede == 1) {
+                score += 60;
+            }
         }
 
         // =====================================================
@@ -899,17 +958,49 @@ public class Logic {
             return -10000;
         }
 
-        if (saidas == 1) {
+        /*
+        * Cobras pequenas podem usar paredes normalmente.
+        * Ter 2 saidas perto da borda nao significa perigo.
+        */
+        if (me.getLength() <= 7) {
 
-            score -= 2500;
+            if (saidas == 1) {
+                score -= 700;
 
-        } else if (saidas == 2) {
+            } else if (saidas == 2) {
+                score += 100;
 
-            score -= 350;
+            } else {
+                score += 200;
+            }
+
+        } else if (me.getLength() <= 10) {
+
+            if (saidas == 1) {
+                score -= 1400;
+
+            } else if (saidas == 2) {
+                score -= 50;
+
+            } else {
+                score += 200;
+            }
 
         } else {
 
-            score += 200;
+            /*
+            * Cobra grande precisa de mais cuidado,
+            * porque o proprio corpo ocupa muito espaco.
+            */
+            if (saidas == 1) {
+                score -= 2500;
+
+            } else if (saidas == 2) {
+                score -= 350;
+
+            } else {
+                score += 200;
+            }
         }
 
         int profundidadeAlcancada =
