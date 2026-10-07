@@ -40,13 +40,11 @@ public class Logic {
 
     public static Map<String, String> info() {
         Map<String, String> info = new HashMap<>();
-
         info.put("apiversion", "1");
         info.put("author", "");
         info.put("color", "#eeff00");
         info.put("head", "snow-worm");
-        info.put("tail", "nr-booster");
-
+        info.put("tail", "bolt");
         return info;
     }
 
@@ -75,45 +73,17 @@ public class Logic {
         Modo modo =
             escolherModo(me, enemy);
 
-        /*
-         * Em caça, evita comida se houver opção segura
-         * sem crescimento.
-         */
-        if (modo == Modo.CACAR) {
-
-            List<String> semComida =
-                new ArrayList<>();
-
-            for (String direction : safeMoves) {
-
-                Coordinate next =
-                    move(
-                        me.getHead(),
-                        direction
-                    );
-
-                if (
-                    !contains(
-                        state.getBoard().getFood(),
-                        next
-                    )
-                ) {
-                    semComida.add(direction);
-                }
-            }
-
-            if (!semComida.isEmpty()) {
-                safeMoves = semComida;
-            }
-        }
-
         Coordinate foodTarget = null;
 
         if (
             modo == Modo.CRESCER ||
-            modo == Modo.SOBREVIVER
+            modo == Modo.SOBREVIVER ||
+            modo == Modo.CACAR ||
+            (
+                modo == Modo.CONTROLAR &&
+                me.getHealth() <= 65
+            )
         ) {
-
             foodTarget =
                 escolherComidaAlvo(
                     state,
@@ -164,7 +134,7 @@ public class Logic {
         Snake enemy
     ) {
 
-        if (me.getHealth() <= 35) {
+        if (me.getHealth() <= 40) {
             return Modo.SOBREVIVER;
         }
 
@@ -172,9 +142,6 @@ public class Logic {
             return Modo.CRESCER;
         }
 
-        /*
-         * Caça somente com vantagem real.
-         */
         if (
             me.getLength() >= 8 &&
             me.getLength() >= enemy.getLength() + 2
@@ -182,10 +149,6 @@ public class Logic {
             return Modo.CACAR;
         }
 
-        /*
-         * Já cresceu bastante mas ainda não
-         * tem vantagem suficiente.
-         */
         if (me.getLength() >= 11) {
             return Modo.CONTROLAR;
         }
@@ -242,7 +205,6 @@ public class Logic {
         // -----------------------------------------------------
 
         if (enemy != null) {
-
             score +=
                 avaliarControleTerritorial(
                     state,
@@ -271,7 +233,8 @@ public class Logic {
                     state,
                     me,
                     next,
-                    foodTarget
+                    foodTarget,
+                    modo
                 );
 
             score +=
@@ -292,7 +255,8 @@ public class Logic {
                     state,
                     me,
                     next,
-                    foodTarget
+                    foodTarget,
+                    modo
                 ) * 2;
 
             score +=
@@ -318,39 +282,29 @@ public class Logic {
                     next
                 ) * 150;
 
-            /*
-             * Cobra grande evita crescer sem necessidade.
-             */
+            // Se a vida estiver caindo, busca comida de verdade.
+            if (
+                me.getHealth() <= 65 &&
+                foodTarget != null
+            ) {
+                score +=
+                    avaliarComida(
+                        state,
+                        me,
+                        next,
+                        foodTarget,
+                        modo
+                    );
+            }
+
+            // Se houver comida exatamente no caminho, pegar continua sendo bom.
             if (
                 contains(
                     state.getBoard().getFood(),
                     next
                 )
             ) {
-                score -= 800;
-            }
-
-            /*
-             * Se somos menores, evitamos aproximar
-             * demais a cabeça adversária.
-             */
-            if (
-                enemy != null &&
-                enemy.getLength() >= me.getLength()
-            ) {
-
-                int distancia =
-                    distanciaManhattan(
-                        next,
-                        enemy.getHead()
-                    );
-
-                if (distancia == 1) {
-                    score -= 1200;
-
-                } else if (distancia == 2) {
-                    score -= 400;
-                }
+                score += 150;
             }
         }
 
@@ -362,6 +316,18 @@ public class Logic {
             modo == Modo.CACAR &&
             enemy != null
         ) {
+
+            // Durante a caca, comida continua secundaria, nao proibida.
+            if (foodTarget != null) {
+                score +=
+                    avaliarComida(
+                        state,
+                        me,
+                        next,
+                        foodTarget,
+                        modo
+                    );
+            }
 
             score +=
                 avaliarCaca(
@@ -450,9 +416,6 @@ public class Logic {
 
                 } else {
 
-                    /*
-                     * Ambos chegam juntos.
-                     */
                     if (
                         me.getLength() >
                         enemy.getLength()
@@ -475,10 +438,6 @@ public class Logic {
             }
         }
 
-        /*
-         * Queremos controlar mais território
-         * do que o adversário.
-         */
         score +=
             (minhasCasas - casasInimigo) * 12;
 
@@ -567,9 +526,6 @@ public class Logic {
                     enemySpace
                 );
 
-            /*
-             * H2H favorável.
-             */
             if (
                 headToHeadFavoravel(
                     me,
@@ -600,9 +556,11 @@ public class Logic {
             );
 
         if (wallDistance == 0) {
+
             score += 450;
 
         } else if (wallDistance == 1) {
+
             score += 220;
         }
 
@@ -643,10 +601,6 @@ public class Logic {
             return true;
         }
 
-        /*
-         * Para ser morte forçada,
-         * TODAS as respostas do inimigo precisam ser ruins.
-         */
         for (Coordinate enemyNext : respostas) {
 
             if (
@@ -659,7 +613,6 @@ public class Logic {
                     profundidade - 1
                 )
             ) {
-
                 return false;
             }
         }
@@ -701,11 +654,6 @@ public class Logic {
             return false;
         }
 
-        /*
-         * O inimigo escolherá a melhor resposta para ele.
-         * Basta existir UMA linha segura para não ser
-         * morte forçada.
-         */
         for (Coordinate next : movimentos) {
 
             if (
@@ -718,7 +666,6 @@ public class Logic {
                     profundidade - 1
                 )
             ) {
-
                 return true;
             }
         }
@@ -761,10 +708,6 @@ public class Logic {
                 continue;
             }
 
-            /*
-             * Nossa cabeça controla essa casa caso
-             * sejamos maiores.
-             */
             if (
                 same(next, myPosition) &&
                 me.getLength() >
@@ -773,10 +716,6 @@ public class Logic {
                 continue;
             }
 
-            /*
-             * Corpos atuais continuam sendo obstáculos
-             * nessa simulação simplificada.
-             */
             if (occupied(state, next)) {
                 continue;
             }
@@ -1176,7 +1115,6 @@ public class Logic {
             !comeu &&
             !novo.isEmpty()
         ) {
-
             novo.remove(
                 novo.size() - 1
             );
@@ -1277,15 +1215,32 @@ public class Logic {
         GameState state,
         Snake me,
         Coordinate next,
-        Coordinate target
+        Coordinate target,
+        Modo modo
     ) {
 
         if (target == null) {
             return 0;
         }
 
+        // Comer neste turno recebe peso conforme o comportamento atual.
         if (same(next, target)) {
-            return 1700;
+
+            if (modo == Modo.SOBREVIVER) {
+                return 4000;
+            }
+
+            if (modo == Modo.CRESCER) {
+                return 3000;
+            }
+
+            if (modo == Modo.CONTROLAR) {
+                return 1200;
+            }
+
+            if (modo == Modo.CACAR) {
+                return 600;
+            }
         }
 
         int[][] distances =
@@ -1307,15 +1262,27 @@ public class Logic {
 
         if (me.getHealth() <= 20) {
 
-            weight = 140;
+            weight = 150;
 
-        } else if (me.getHealth() <= 35) {
+        } else if (me.getHealth() <= 40) {
 
-            weight = 95;
+            weight = 110;
+
+        } else if (modo == Modo.CRESCER) {
+
+            weight = 80;
+
+        } else if (modo == Modo.CONTROLAR) {
+
+            weight = 30;
+
+        } else if (modo == Modo.CACAR) {
+
+            weight = 15;
 
         } else {
 
-            weight = 45;
+            weight = 60;
         }
 
         return
@@ -1452,10 +1419,6 @@ public class Logic {
 
             for (Coordinate enemyNext : enemyMoves) {
 
-                /*
-                 * Casas onde perderiamos ou empatariamos
-                 * head-to-head sao tratadas como perigosas.
-                 */
                 if (
                     headToHeadPerigoso(
                         me,
@@ -2168,7 +2131,6 @@ public class Logic {
             int y,
             int distance
         ) {
-
             this.x = x;
             this.y = y;
             this.distance = distance;
