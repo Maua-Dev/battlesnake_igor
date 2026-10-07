@@ -1,6 +1,3 @@
-
-
-
 package com.mauadev.code;
 // Documentacao: https://docs.battlesnake.com
 
@@ -8,12 +5,28 @@ import com.mauadev.code.entities.Coordinate;
 import com.mauadev.code.entities.GameState;
 import com.mauadev.code.entities.Snake;
 
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Queue;
 import java.util.concurrent.ThreadLocalRandom;
 
 public class Logic {
 
     private static final int INFINITO = 1_000_000;
+
+    // Direcoes usadas pelo Dijkstra e Flood Fill.
+    private static final int[][] DIRECTIONS = {
+            {1, 0},
+            {-1, 0},
+            {0, 1},
+            {0, -1}
+    };
 
     private enum Comportamento {
         ALIMENTAR,
@@ -26,11 +39,13 @@ public class Logic {
 
     public static Map<String, String> info() {
         Map<String, String> info = new HashMap<>();
+
         info.put("apiversion", "1");
         info.put("author", "");
         info.put("color", "#8B0000");
-        info.put("head", "tiger-king");
-        info.put("tail", "hook");
+        info.put("head", "beluga");
+        info.put("tail", "MLH");
+
         return info;
     }
 
@@ -47,12 +62,12 @@ public class Logic {
     public static String getMove(GameState state) {
 
         Snake me = state.getYou();
-        Coordinate head = me.getHead();
+        Coordinate myHead = me.getHead();
 
         List<Snake> enemies = getEnemies(state);
         List<String> safeMoves = getSafeMoves(state, me);
 
-        // Nenhum movimento realmente seguro.
+        // Se nao existe jogada realmente segura.
         if (safeMoves.isEmpty()) {
             return emergencyMove(state, me);
         }
@@ -60,10 +75,7 @@ public class Logic {
         Comportamento comportamento =
                 escolherComportamento(me, enemies);
 
-        int bestScore = Integer.MIN_VALUE;
-        List<String> bestMoves = new ArrayList<>();
-
-        // Calcula previamente o mapa dos adversarios.
+        // Calcula uma vez o mapa de distancias de cada inimigo.
         List<int[][]> enemyDistances = new ArrayList<>();
 
         for (Snake enemy : enemies) {
@@ -72,36 +84,47 @@ public class Logic {
             );
         }
 
-        for (String move : safeMoves) {
+        int bestScore = Integer.MIN_VALUE;
 
-            Coordinate next = move(head, move);
+        List<String> bestMoves = new ArrayList<>();
 
-            int score = avaliarMovimento(
-                    state,
-                    me,
-                    enemies,
-                    enemyDistances,
-                    next,
-                    comportamento
-            );
+        for (String direction : safeMoves) {
+
+            Coordinate next =
+                    move(myHead, direction);
+
+            int score =
+                    avaliarMovimento(
+                            state,
+                            me,
+                            enemies,
+                            enemyDistances,
+                            next,
+                            comportamento
+                    );
 
             if (score > bestScore) {
+
                 bestScore = score;
+
                 bestMoves.clear();
-                bestMoves.add(move);
+                bestMoves.add(direction);
 
             } else if (score == bestScore) {
-                bestMoves.add(move);
+
+                bestMoves.add(direction);
             }
         }
 
+        // Aleatoriedade apenas quando duas jogadas possuem o mesmo valor.
         return bestMoves.get(
-                ThreadLocalRandom.current().nextInt(bestMoves.size())
+                ThreadLocalRandom.current()
+                        .nextInt(bestMoves.size())
         );
     }
 
     // ---------------------------------------------------------
-    // COMPORTAMENTO
+    // ESCOLHA DO COMPORTAMENTO
     // ---------------------------------------------------------
 
     private static Comportamento escolherComportamento(
@@ -109,7 +132,7 @@ public class Logic {
             List<Snake> enemies
     ) {
 
-        // Com pouca vida, comida sempre ganha da caça.
+        // Com pouca vida, procurar comida tem prioridade.
         if (me.getHealth() <= 40) {
             return Comportamento.ALIMENTAR;
         }
@@ -121,16 +144,22 @@ public class Logic {
         int maiorInimigo = 0;
 
         for (Snake enemy : enemies) {
+
             maiorInimigo = Math.max(
                     maiorInimigo,
                     enemy.getLength()
             );
         }
 
-        // So caca se realmente possuir vantagem.
-        if (me.getLength() >= 7 &&
-                me.getLength() >= maiorInimigo + 2 &&
-                me.getHealth() >= 50) {
+        /*
+         * Entra em modo de caca apenas com:
+         * - tamanho minimo razoavel;
+         * - vantagem de pelo menos 2;
+         * - vida suficiente.
+         */
+        if (me.getLength() >= 7
+                && me.getLength() >= maiorInimigo + 2
+                && me.getHealth() >= 50) {
 
             return Comportamento.CACAR;
         }
@@ -139,7 +168,7 @@ public class Logic {
     }
 
     // ---------------------------------------------------------
-    // AVALIACAO
+    // AVALIACAO DE CADA MOVIMENTO
     // ---------------------------------------------------------
 
     private static int avaliarMovimento(
@@ -153,22 +182,39 @@ public class Logic {
 
         int score = 0;
 
-        // 1. Espaco disponivel.
-        int space = floodFill(state, next);
+        // -----------------------------------------------------
+        // 1. ESPACO LIVRE
+        // -----------------------------------------------------
 
+        int space =
+                floodFill(state, next);
+
+        /*
+         * Ter espaco e uma das prioridades principais.
+         * Cada casa acessivel vale 8 pontos.
+         */
         score += space * 8;
 
-        // Entrar em espaco menor que o proprio corpo e perigoso.
+        /*
+         * Se o espaco disponivel for menor ou igual ao nosso
+         * proprio tamanho, existe grande risco de aprisionamento.
+         */
         if (space <= me.getLength()) {
             score -= 2500;
         }
 
-        // 2. Hazards.
+        // -----------------------------------------------------
+        // 2. HAZARDS
+        // -----------------------------------------------------
+
         if (isHazard(state, next)) {
             score -= 300;
         }
 
-        // 3. Alimentacao.
+        // -----------------------------------------------------
+        // 3. COMIDA
+        // -----------------------------------------------------
+
         score += foodScore(
                 state,
                 me,
@@ -178,7 +224,10 @@ public class Logic {
                 comportamento
         );
 
-        // 4. Caca.
+        // -----------------------------------------------------
+        // 4. CACA
+        // -----------------------------------------------------
+
         if (comportamento == Comportamento.CACAR) {
 
             score += huntScore(
@@ -189,8 +238,16 @@ public class Logic {
             );
         }
 
-        // 5. Evita ficar grudado na parede sem necessidade.
+        // -----------------------------------------------------
+        // 5. POSICIONAMENTO
+        // -----------------------------------------------------
+
+        /*
+         * Parede e centro sao preferencias estrategicas.
+         * Nunca possuem peso maior que sobrevivencia.
+         */
         score += wallScore(state, next);
+        score += centerScore(state, next);
 
         return score;
     }
@@ -208,35 +265,39 @@ public class Logic {
             Comportamento comportamento
     ) {
 
-        List<Coordinate> foods = state.getBoard().getFood();
+        List<Coordinate> foods =
+                state.getBoard().getFood();
 
         if (foods == null || foods.isEmpty()) {
             return 0;
         }
 
-        int[][] myDistances = dijkstra(
-                state,
-                start,
-                me
-        );
+        int[][] myDistances =
+                dijkstra(state, start, me);
 
         int bestFoodDistance = INFINITO;
+
         boolean encontrouComidaSegura = false;
 
         for (Coordinate food : foods) {
 
             int myDistance =
-                    myDistances[food.getY()][food.getX()];
+                    myDistances
+                            [food.getY()]
+                            [food.getX()];
 
             if (myDistance >= INFINITO) {
                 continue;
             }
 
-            // Ja gastamos um turno para chegar em "start".
+            /*
+             * Ja gastamos um movimento para chegar em start.
+             */
             int myArrival = myDistance + 1;
 
             boolean safeFood = true;
 
+            // Compara nossa chegada com a dos adversarios.
             for (int i = 0; i < enemies.size(); i++) {
 
                 Snake enemy = enemies.get(i);
@@ -251,11 +312,11 @@ public class Logic {
                 }
 
                 /*
-                 * Se o inimigo maior ou igual chega primeiro
-                 * ou junto, nao vale disputar.
+                 * Se uma cobra maior ou igual chega antes
+                 * ou simultaneamente, nao disputamos.
                  */
-                if (enemy.getLength() >= me.getLength() &&
-                        enemyDistance <= myArrival) {
+                if (enemy.getLength() >= me.getLength()
+                        && enemyDistance <= myArrival) {
 
                     safeFood = false;
                     break;
@@ -268,10 +329,11 @@ public class Logic {
 
             encontrouComidaSegura = true;
 
-            bestFoodDistance = Math.min(
-                    bestFoodDistance,
-                    myDistance
-            );
+            bestFoodDistance =
+                    Math.min(
+                            bestFoodDistance,
+                            myDistance
+                    );
         }
 
         if (!encontrouComidaSegura) {
@@ -280,24 +342,30 @@ public class Logic {
 
         int weight;
 
-        // Quanto menor a vida, mais importante fica a comida.
+        /*
+         * Quanto menor a vida, maior o peso da comida.
+         */
         if (me.getHealth() <= 20) {
+
             weight = 100;
 
         } else if (me.getHealth() <= 40) {
+
             weight = 65;
 
         } else if (me.getHealth() <= 60) {
+
             weight = 35;
 
         } else if (comportamento == Comportamento.CACAR) {
+
             weight = 5;
 
         } else {
+
             weight = 15;
         }
 
-        // Quanto menor a distancia, maior a pontuacao.
         return Math.max(
                 0,
                 20 - bestFoodDistance
@@ -322,17 +390,27 @@ public class Logic {
 
         for (Snake enemy : enemies) {
 
-            // Nao tenta cacar cobra maior ou igual.
+            // Nao tenta cacar inimigo maior ou igual.
             if (enemy.getLength() >= me.getLength()) {
                 continue;
             }
 
             List<Coordinate> enemyMoves =
-                    getPossibleEnemyMoves(state, enemy);
+                    getPossibleEnemyMoves(
+                            state,
+                            enemy
+                    );
 
+            /*
+             * Inimigo sem movimentos ja esta praticamente morto.
+             */
             if (enemyMoves.isEmpty()) {
-                // Inimigo encurralado.
-                bestScore = Math.max(bestScore, 800);
+
+                bestScore = Math.max(
+                        bestScore,
+                        800
+                );
+
                 continue;
             }
 
@@ -340,9 +418,12 @@ public class Logic {
 
             for (Coordinate enemyNext : enemyMoves) {
 
-                // Podemos ganhar uma colisao frontal.
-                if (same(next, enemyNext) &&
-                        me.getLength() > enemy.getLength()) {
+                /*
+                 * Se ambos podem entrar na mesma casa e somos
+                 * maiores, a colisao frontal nos favorece.
+                 */
+                if (same(next, enemyNext)
+                        && me.getLength() > enemy.getLength()) {
 
                     bestScore = Math.max(
                             bestScore,
@@ -351,43 +432,156 @@ public class Logic {
                 }
 
                 int distance =
-                        myDistances[enemyNext.getY()]
-                                   [enemyNext.getX()];
+                        myDistances
+                                [enemyNext.getY()]
+                                [enemyNext.getX()];
 
-                minDistance = Math.min(
-                        minDistance,
-                        distance
-                );
+                minDistance =
+                        Math.min(
+                                minDistance,
+                                distance
+                        );
             }
 
             if (minDistance < INFINITO) {
 
-                // Aproximar-se das rotas de fuga do inimigo.
+                /*
+                 * Quanto menor a distancia das rotas de fuga,
+                 * maior a pressao exercida.
+                 */
                 int pressure =
-                        Math.max(0, 15 - minDistance) * 20;
+                        Math.max(
+                                0,
+                                15 - minDistance
+                        ) * 20;
 
                 /*
-                 * Quanto menos movimentos o inimigo possui,
-                 * melhor nossa pressao.
+                 * Inimigo com poucas rotas recebe mais pressao.
                  */
                 pressure +=
                         (4 - enemyMoves.size()) * 70;
 
                 /*
-                 * Quanto maior nossa vantagem de tamanho,
-                 * mais agressivos podemos ser.
+                 * Maior vantagem de tamanho permite maior
+                 * agressividade.
                  */
                 pressure +=
-                        (me.getLength() - enemy.getLength()) * 15;
+                        (me.getLength()
+                                - enemy.getLength()) * 15;
 
-                bestScore = Math.max(
-                        bestScore,
-                        pressure
-                );
+                bestScore =
+                        Math.max(
+                                bestScore,
+                                pressure
+                        );
             }
         }
 
         return bestScore;
+    }
+
+    // ---------------------------------------------------------
+    // POSICIONAMENTO CENTRAL
+    // ---------------------------------------------------------
+
+    private static int centerScore(
+            GameState state,
+            Coordinate position
+    ) {
+
+        int width =
+                state.getBoard().getWidth();
+
+        int height =
+                state.getBoard().getHeight();
+
+        int centerX = width / 2;
+        int centerY = height / 2;
+
+        /*
+         * Distancia Manhattan ate o centro.
+         *
+         * Em um 11x11:
+         * centro = (5,5)
+         */
+        int distance =
+                Math.abs(position.getX() - centerX)
+                        + Math.abs(position.getY() - centerY);
+
+        /*
+         * Bônus moderado.
+         * O centro e desejavel, mas nunca supera
+         * sobrevivencia, comida urgente ou espaco.
+         */
+        return Math.max(
+                0,
+                10 - distance
+        ) * 6;
+    }
+
+    // ---------------------------------------------------------
+    // PENALIDADE DE PAREDE
+    // ---------------------------------------------------------
+
+    private static int wallScore(
+            GameState state,
+            Coordinate position
+    ) {
+
+        int width =
+                state.getBoard().getWidth();
+
+        int height =
+                state.getBoard().getHeight();
+
+        int distanceLeft =
+                position.getX();
+
+        int distanceRight =
+                width - 1 - position.getX();
+
+        int distanceDown =
+                position.getY();
+
+        int distanceUp =
+                height - 1 - position.getY();
+
+        int nearestWall =
+                Math.min(
+                        Math.min(
+                                distanceLeft,
+                                distanceRight
+                        ),
+                        Math.min(
+                                distanceDown,
+                                distanceUp
+                        )
+                );
+
+        /*
+         * Borda recebe penalidade forte.
+         */
+        if (nearestWall == 0) {
+            return -80;
+        }
+
+        /*
+         * Uma casa da parede ainda e uma zona
+         * relativamente perigosa.
+         */
+        if (nearestWall == 1) {
+            return -30;
+        }
+
+        /*
+         * Duas casas da parede ja e aceitavel.
+         */
+        if (nearestWall == 2) {
+            return 10;
+        }
+
+        // Area interna.
+        return 25;
     }
 
     // ---------------------------------------------------------
@@ -409,26 +603,31 @@ public class Logic {
                         )
                 );
 
-        Coordinate head = me.getHead();
+        Coordinate head =
+                me.getHead();
 
         safeMoves.removeIf(direction -> {
 
-            Coordinate next = move(
-                    head,
-                    direction
-            );
+            Coordinate next =
+                    move(
+                            head,
+                            direction
+                    );
 
-            // Parede.
+            // Nao sai do tabuleiro.
             if (!insideBoard(state, next)) {
                 return true;
             }
 
-            // Corpo.
+            // Nao entra em corpos.
             if (occupied(state, next)) {
                 return true;
             }
 
-            // Possivel head-to-head perigoso.
+            /*
+             * Evita posicoes onde cobra maior ou igual
+             * tambem pode entrar no proximo turno.
+             */
             for (Snake enemy : getEnemies(state)) {
 
                 if (enemy.getLength() < me.getLength()) {
@@ -436,7 +635,10 @@ public class Logic {
                 }
 
                 List<Coordinate> enemyMoves =
-                        getPossibleEnemyMoves(state, enemy);
+                        getPossibleEnemyMoves(
+                                state,
+                                enemy
+                        );
 
                 for (Coordinate enemyNext : enemyMoves) {
 
@@ -453,7 +655,7 @@ public class Logic {
     }
 
     // ---------------------------------------------------------
-    // POSSIVEIS MOVIMENTOS DO INIMIGO
+    // MOVIMENTOS POSSIVEIS DO ADVERSARIO
     // ---------------------------------------------------------
 
     private static List<Coordinate> getPossibleEnemyMoves(
@@ -464,24 +666,38 @@ public class Logic {
         List<Coordinate> positions =
                 new ArrayList<>();
 
-        Coordinate head = enemy.getHead();
+        Coordinate head =
+                enemy.getHead();
 
         for (String direction :
-                Arrays.asList("up", "down", "left", "right")) {
+                Arrays.asList(
+                        "up",
+                        "down",
+                        "left",
+                        "right"
+                )) {
 
             Coordinate next =
-                    move(head, direction);
+                    move(
+                            head,
+                            direction
+                    );
 
             if (!insideBoard(state, next)) {
                 continue;
             }
 
-            // Impede voltar diretamente contra o pescoco.
-            List<Coordinate> body = enemy.getBody();
+            List<Coordinate> body =
+                    enemy.getBody();
 
+            /*
+             * Impede que o inimigo seja considerado capaz
+             * de voltar pelo proprio pescoco.
+             */
             if (body != null && body.size() >= 2) {
 
-                Coordinate neck = body.get(1);
+                Coordinate neck =
+                        body.get(1);
 
                 if (same(next, neck)) {
                     continue;
@@ -508,8 +724,11 @@ public class Logic {
             Snake snake
     ) {
 
-        int width = state.getBoard().getWidth();
-        int height = state.getBoard().getHeight();
+        int width =
+                state.getBoard().getWidth();
+
+        int height =
+                state.getBoard().getHeight();
 
         int[][] distance =
                 new int[height][width];
@@ -520,7 +739,9 @@ public class Logic {
 
         PriorityQueue<Node> queue =
                 new PriorityQueue<>(
-                        Comparator.comparingInt(n -> n.distance)
+                        Comparator.comparingInt(
+                                node -> node.distance
+                        )
                 );
 
         distance[start.getY()][start.getX()] = 0;
@@ -535,17 +756,22 @@ public class Logic {
 
         while (!queue.isEmpty()) {
 
-            Node current = queue.poll();
+            Node current =
+                    queue.poll();
 
-            if (current.distance !=
-                    distance[current.y][current.x]) {
+            if (current.distance
+                    != distance[current.y][current.x]) {
+
                 continue;
             }
 
-            for (int[] dir : DIRECTIONS) {
+            for (int[] direction : DIRECTIONS) {
 
-                int nx = current.x + dir[0];
-                int ny = current.y + dir[1];
+                int nx =
+                        current.x + direction[0];
+
+                int ny =
+                        current.y + direction[1];
 
                 Coordinate next =
                         coordinate(nx, ny);
@@ -555,34 +781,42 @@ public class Logic {
                 }
 
                 /*
-                 * O ponto inicial pode estar ocupado porque
-                 * e a cabeca de uma cobra.
+                 * Corpos sao obstaculos.
+                 * A propria posicao inicial e permitida.
                  */
-                if (occupied(state, next) &&
-                        !same(next, start)) {
+                if (occupied(state, next)
+                        && !same(next, start)) {
 
                     continue;
                 }
 
                 int movementCost = 1;
 
-                // Hazards continuam possiveis, mas sao caros.
+                /*
+                 * Hazard e atravessavel, mas caro.
+                 */
                 if (isHazard(state, next)) {
                     movementCost += 15;
                 }
 
                 /*
-                 * Regioes onde uma cobra maior pode chegar
-                 * ficam mais caras.
+                 * Casas que podem ser alcancadas por inimigos
+                 * maiores ou iguais recebem custo alto.
                  */
-                for (Snake enemy : getEnemiesOf(state, snake)) {
+                for (Snake enemy :
+                        getEnemiesOf(state, snake)) {
 
-                    if (enemy.getLength() < snake.getLength()) {
+                    if (enemy.getLength()
+                            < snake.getLength()) {
+
                         continue;
                     }
 
                     for (Coordinate danger :
-                            getPossibleEnemyMoves(state, enemy)) {
+                            getPossibleEnemyMoves(
+                                    state,
+                                    enemy
+                            )) {
 
                         if (same(next, danger)) {
                             movementCost += 40;
@@ -591,9 +825,11 @@ public class Logic {
                 }
 
                 int newDistance =
-                        current.distance + movementCost;
+                        current.distance
+                                + movementCost;
 
-                if (newDistance < distance[ny][nx]) {
+                if (newDistance
+                        < distance[ny][nx]) {
 
                     distance[ny][nx] =
                             newDistance;
@@ -621,8 +857,11 @@ public class Logic {
             Coordinate start
     ) {
 
-        int width = state.getBoard().getWidth();
-        int height = state.getBoard().getHeight();
+        int width =
+                state.getBoard().getWidth();
+
+        int height =
+                state.getBoard().getHeight();
 
         boolean[][] visited =
                 new boolean[height][width];
@@ -632,20 +871,28 @@ public class Logic {
 
         queue.add(start);
 
-        visited[start.getY()][start.getX()] = true;
+        visited
+                [start.getY()]
+                [start.getX()] = true;
 
         int space = 0;
 
         while (!queue.isEmpty()) {
 
-            Coordinate current = queue.poll();
+            Coordinate current =
+                    queue.poll();
 
             space++;
 
-            for (int[] dir : DIRECTIONS) {
+            for (int[] direction : DIRECTIONS) {
 
-                int nx = current.getX() + dir[0];
-                int ny = current.getY() + dir[1];
+                int nx =
+                        current.getX()
+                                + direction[0];
+
+                int ny =
+                        current.getY()
+                                + direction[1];
 
                 Coordinate next =
                         coordinate(nx, ny);
@@ -658,8 +905,8 @@ public class Logic {
                     continue;
                 }
 
-                if (occupied(state, next) &&
-                        !same(next, start)) {
+                if (occupied(state, next)
+                        && !same(next, start)) {
 
                     continue;
                 }
@@ -673,37 +920,7 @@ public class Logic {
     }
 
     // ---------------------------------------------------------
-    // PAREDES
-    // ---------------------------------------------------------
-
-    private static int wallScore(
-            GameState state,
-            Coordinate position
-    ) {
-
-        int width = state.getBoard().getWidth();
-        int height = state.getBoard().getHeight();
-
-        int distanceLeft = position.getX();
-        int distanceRight =
-                width - 1 - position.getX();
-
-        int distanceDown = position.getY();
-        int distanceUp =
-                height - 1 - position.getY();
-
-        int nearestWall =
-                Math.min(
-                        Math.min(distanceLeft, distanceRight),
-                        Math.min(distanceDown, distanceUp)
-                );
-
-        // Pequeno incentivo para nao ficar preso nas bordas.
-        return nearestWall * 2;
-    }
-
-    // ---------------------------------------------------------
-    // EMERGENCIA
+    // MOVIMENTO DE EMERGENCIA
     // ---------------------------------------------------------
 
     private static String emergencyMove(
@@ -715,11 +932,23 @@ public class Logic {
                 new ArrayList<>();
 
         for (String direction :
-                Arrays.asList("up", "down", "left", "right")) {
+                Arrays.asList(
+                        "up",
+                        "down",
+                        "left",
+                        "right"
+                )) {
 
             Coordinate next =
-                    move(me.getHead(), direction);
+                    move(
+                            me.getHead(),
+                            direction
+                    );
 
+            /*
+             * Em emergencia pelo menos tenta continuar
+             * dentro do tabuleiro.
+             */
             if (insideBoard(state, next)) {
                 possible.add(direction);
             }
@@ -736,23 +965,19 @@ public class Logic {
     }
 
     // ---------------------------------------------------------
-    // AUXILIARES
+    // MOVIMENTACAO
     // ---------------------------------------------------------
-
-    private static final int[][] DIRECTIONS = {
-            {1, 0},
-            {-1, 0},
-            {0, 1},
-            {0, -1}
-    };
 
     private static Coordinate move(
             Coordinate position,
             String direction
     ) {
 
-        int x = position.getX();
-        int y = position.getY();
+        int x =
+                position.getX();
+
+        int y =
+                position.getY();
 
         switch (direction) {
 
@@ -771,10 +996,17 @@ public class Logic {
             case "right":
                 x++;
                 break;
+
+            default:
+                break;
         }
 
         return coordinate(x, y);
     }
+
+    // ---------------------------------------------------------
+    // COORDENADA
+    // ---------------------------------------------------------
 
     private static Coordinate coordinate(
             int x,
@@ -790,24 +1022,45 @@ public class Logic {
         return coordinate;
     }
 
+    // ---------------------------------------------------------
+    // TABULEIRO
+    // ---------------------------------------------------------
+
     private static boolean insideBoard(
             GameState state,
             Coordinate position
     ) {
 
-        return position.getX() >= 0 &&
-                position.getY() >= 0 &&
-                position.getX() < state.getBoard().getWidth() &&
-                position.getY() < state.getBoard().getHeight();
+        return position.getX() >= 0
+                && position.getY() >= 0
+                && position.getX()
+                < state.getBoard().getWidth()
+                && position.getY()
+                < state.getBoard().getHeight();
     }
+
+    // ---------------------------------------------------------
+    // OCUPACAO
+    // ---------------------------------------------------------
 
     private static boolean occupied(
             GameState state,
             Coordinate position
     ) {
 
-        if (state.getYou() != null &&
-                contains(
+        if (state.getBoard() == null) {
+            return false;
+        }
+
+        List<Snake> snakes =
+                state.getBoard().getSnakes();
+
+        /*
+         * Em alguns testes snakes pode estar vazio,
+         * portanto verificamos tambem "you".
+         */
+        if (state.getYou() != null
+                && contains(
                         state.getYou().getBody(),
                         position
                 )) {
@@ -815,14 +1068,11 @@ public class Logic {
             return true;
         }
 
-        if (state.getBoard() == null ||
-                state.getBoard().getSnakes() == null) {
-
+        if (snakes == null) {
             return false;
         }
 
-        for (Snake snake :
-                state.getBoard().getSnakes()) {
+        for (Snake snake : snakes) {
 
             if (contains(
                     snake.getBody(),
@@ -836,47 +1086,25 @@ public class Logic {
         return false;
     }
 
-    private static boolean contains(
-            List<Coordinate> coordinates,
-            Coordinate target
-    ) {
-
-        if (coordinates == null) {
-            return false;
-        }
-
-        for (Coordinate coordinate : coordinates) {
-
-            if (same(coordinate, target)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static boolean same(
-            Coordinate a,
-            Coordinate b
-    ) {
-
-        return a != null &&
-                b != null &&
-                a.getX() == b.getX() &&
-                a.getY() == b.getY();
-    }
+    // ---------------------------------------------------------
+    // HAZARD
+    // ---------------------------------------------------------
 
     private static boolean isHazard(
             GameState state,
             Coordinate position
     ) {
 
-        return state.getBoard().getHazards() != null &&
-                contains(
+        return state.getBoard().getHazards() != null
+                && contains(
                         state.getBoard().getHazards(),
                         position
                 );
     }
+
+    // ---------------------------------------------------------
+    // INIMIGOS
+    // ---------------------------------------------------------
 
     private static List<Snake> getEnemies(
             GameState state
@@ -896,8 +1124,8 @@ public class Logic {
         List<Snake> enemies =
                 new ArrayList<>();
 
-        if (state.getBoard() == null ||
-                state.getBoard().getSnakes() == null) {
+        if (state.getBoard() == null
+                || state.getBoard().getSnakes() == null) {
 
             return enemies;
         }
@@ -905,9 +1133,10 @@ public class Logic {
         for (Snake other :
                 state.getBoard().getSnakes()) {
 
-            if (snake != null &&
-                    snake.getId() != null &&
-                    snake.getId().equals(other.getId())) {
+            if (snake != null
+                    && snake.getId() != null
+                    && snake.getId()
+                    .equals(other.getId())) {
 
                 continue;
             }
@@ -916,6 +1145,45 @@ public class Logic {
         }
 
         return enemies;
+    }
+
+    // ---------------------------------------------------------
+    // LISTA CONTEM COORDENADA
+    // ---------------------------------------------------------
+
+    private static boolean contains(
+            List<Coordinate> coordinates,
+            Coordinate target
+    ) {
+
+        if (coordinates == null) {
+            return false;
+        }
+
+        for (Coordinate coordinate :
+                coordinates) {
+
+            if (same(coordinate, target)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ---------------------------------------------------------
+    // COMPARACAO DE COORDENADAS
+    // ---------------------------------------------------------
+
+    private static boolean same(
+            Coordinate first,
+            Coordinate second
+    ) {
+
+        return first != null
+                && second != null
+                && first.getX() == second.getX()
+                && first.getY() == second.getY();
     }
 
     // ---------------------------------------------------------
