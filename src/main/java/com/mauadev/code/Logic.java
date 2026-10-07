@@ -1,36 +1,56 @@
 package com.mauadev.code;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 import com.mauadev.code.entities.Coordinate;
 import com.mauadev.code.entities.GameState;
 import com.mauadev.code.entities.Snake;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.PriorityQueue;
-import java.util.Queue;
-
+/**
+ * Bot de Battlesnake baseado em busca adversarial.
+ *
+ * Ideia geral:
+ *  1. O estado do jogo e convertido em um modelo interno que simula as regras
+ *     oficiais (movimento, rabo que sai, comida, hazard, colisoes, head-to-head).
+ *  2. Uma busca com aprofundamento iterativo (minimax com movimentos simultaneos
+ *     e poda alpha-beta) escolhe o movimento que da o melhor resultado no pior
+ *     caso, considerando TODAS as cobras inimigas.
+ *  3. Nas folhas, o estado e avaliado por territorio (Voronoi), espaco
+ *     alcancavel, tamanho relativo, fome e distancia da comida.
+ *
+ * Nao ha estado estatico mutavel: varias partidas podem ser jogadas em paralelo.
+ */
 public class Logic {
 
-    private static final int INFINITO = 1_000_000;
-    private static final int PROFUNDIDADE_PREVISAO = 6;
+    // =========================================================
+    // CONFIGURACAO
+    // =========================================================
 
-    private static final int[][] DIRECTIONS = {
-        {1, 0},
-        {-1, 0},
-        {0, 1},
-        {0, -1}
-    };
+    /** Tempo maximo de busca por jogada (o limite do Battlesnake e 500 ms). */
+    private static final long TIME_BUDGET_NANOS =
+        Long.getLong("snake.budget.ms", 300L) * 1_000_000L;
 
-    private enum Modo {
-        CRESCER,
-        CONTROLAR,
-        SOBREVIVER
-    }
+    private static final int MAX_DEPTH = 24;
+
+    /** Quantos inimigos (os mais proximos) sao ramificados por completo na busca. */
+    private static final int FULL_BRANCH_OPPONENTS = 2;
+
+    /** Dano extra por turno em casa de hazard (ruleset royale padrao). */
+    private static final int HAZARD_DAMAGE = 14;
+
+    private static final int INF = 1_000_000;
+    private static final int WIN = 100_000;
+    private static final int LOSS = -100_000;
+    private static final int DRAW = -30_000;
+    private static final int UNREACHABLE = 10_000;
+
+    private static final String[] NAMES = {"up", "down", "left", "right"};
+    private static final int[] DX = {0, 0, -1, 1};
+    private static final int[] DY = {1, -1, 0, 0};
 
     // =========================================================
     // INFORMACOES
@@ -54,1775 +74,909 @@ public class Logic {
     public static void end(GameState state) {
     }
 
-    private static int distanciaParede(
-        GameState state,
-        Coordinate position
-    ) {
-
-        int esquerda =
-            position.getX();
-
-        int direita =
-            state.getBoard().getWidth()
-            - 1
-            - position.getX();
-
-        int baixo =
-            position.getY();
-
-        int cima =
-            state.getBoard().getHeight()
-            - 1
-            - position.getY();
-
-        return
-            Math.min(
-                Math.min(
-                    esquerda,
-                    direita
-                ),
-                Math.min(
-                    baixo,
-                    cima
-                )
-            );
-    }
-
     // =========================================================
     // DECISAO PRINCIPAL
     // =========================================================
 
     public static String getMove(GameState state) {
 
-        Snake me = state.getYou();
-        Snake enemy = encontrarPrincipalInimigo(state);
+        long deadline = System.nanoTime() + TIME_BUDGET_NANOS;
+        World world = null;
 
-        List<String> safeMoves =
-            getSafeMoves(
-                state,
-                me,
-                enemy
-            );
+        try {
+            world = buildWorld(state);
 
-        if (safeMoves.isEmpty()) {
-            return emergencyMove(state, me);
-        }
-
-        Modo modo =
-            escolherModo(
-                me,
-                enemy
-            );
-
-        /*
-         * Sempre tentamos ter uma fruta como alvo.
-         * CONTROLAR nao significa ignorar comida.
-         */
-        Coordinate foodTarget =
-            escolherComidaAlvo(
-                state,
-                me,
-                enemy
-            );
-
-        String melhorMove =
-            safeMoves.get(0);
-
-        int melhorScore =
-            Integer.MIN_VALUE;
-
-        for (String direction : safeMoves) {
-
-            Coordinate next =
-                move(
-                    me.getHead(),
-                    direction
-                );
-
-            int score =
-                avaliarMovimento(
-                    state,
-                    me,
-                    enemy,
-                    next,
-                    modo,
-                    foodTarget
-                );
-
-            if (score > melhorScore) {
-                melhorScore = score;
-                melhorMove = direction;
+            if (world == null) {
+                return "up";
             }
-        }
 
-        return melhorMove;
+            return NAMES[new Search(world, deadline).run()];
+
+        } catch (RuntimeException e) {
+
+            // Nunca devolve erro HTTP por causa de um bug: joga o movimento
+            // legal mais simples.
+            try {
+                if (world != null) {
+                    Search s = new Search(world, Long.MAX_VALUE);
+                    return NAMES[s.legalMoves(world, 0, s.computeRelease(world))[0]];
+                }
+            } catch (RuntimeException ignored) {
+                // cai no retorno padrao
+            }
+
+            return "up";
+        }
     }
 
     // =========================================================
-    // MODO
+    // GEOMETRIA DO TABULEIRO
     // =========================================================
 
-    private static Modo escolherModo(
-        Snake me,
-        Snake enemy
-    ) {
+    /** Tabela de vizinhos pre-calculada. Celula = y * largura + x. */
+    private static final class Geo {
 
-        // Vida baixa: comida se torna prioridade máxima.
-        if (me.getHealth() <= 40) {
-            return Modo.SOBREVIVER;
-        }
+        final int w;
+        final int h;
+        final int cells;
+        final int[][] nbr;
 
-        /*
-         * Cresce até alcançar um tamanho confortável.
-         * Depois passa a jogar principalmente por território.
-         */
-        if (me.getLength() < 10) {
-            return Modo.CRESCER;
-        }
+        Geo(int w, int h) {
+            this.w = w;
+            this.h = h;
+            this.cells = w * h;
+            this.nbr = new int[cells][4];
 
-        return Modo.CONTROLAR;
-    }
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    for (int d = 0; d < 4; d++) {
 
-    // =========================================================
-    // AVALIACAO DO MOVIMENTO
-    // =========================================================
+                        int nx = x + DX[d];
+                        int ny = y + DY[d];
 
-    private static int avaliarMovimento(
-        GameState state,
-        Snake me,
-        Snake enemy,
-        Coordinate next,
-        Modo modo,
-        Coordinate foodTarget
-    ) {
-
-        int score = 0;
-
-        // =====================================================
-        // 1. SOBREVIVENCIA
-        // =====================================================
-
-        int meuEspaco =
-            floodFill(
-                state,
-                next,
-                null
-            );
-
-        score += meuEspaco * 10;
-
-        /*
-         * Evita entrar em regioes menores que o
-         * proprio corpo.
-         */
-        if (meuEspaco <= me.getLength()) {
-            score -= 6000;
-        }
-
-        /*
-         * Analisa se conseguimos continuar nos
-         * proximos turnos sem fechar o proprio corpo.
-         */
-        score +=
-            avaliarFuturoProprio(
-                state,
-                me,
-                next,
-                PROFUNDIDADE_PREVISAO
-            );
-
-        if (isHazard(state, next)) {
-            score -= 700;
-        }
-
-        // =====================================================
-        // PAREDE NO INICIO
-        // =====================================================
-
-        if (me.getLength() <= 7) {
-
-            int distanciaParede =
-                distanciaParede(
-                    state,
-                    next
-                );
-
-            /*
-            * Nao recompensa fugir para o centro.
-            * A borda e uma regiao perfeitamente valida
-            * para uma cobra pequena.
-            */
-            if (distanciaParede == 0) {
-                score += 120;
-
-            } else if (distanciaParede == 1) {
-                score += 60;
+                        nbr[y * w + x][d] =
+                            (nx >= 0 && ny >= 0 && nx < w && ny < h)
+                                ? ny * w + nx
+                                : -1;
+                    }
+                }
             }
         }
 
-        // =====================================================
-        // 2. COMIDA
-        // =====================================================
-
-        int comidaScore =
-            avaliarComida(
-                state,
-                me,
-                next,
-                foodTarget,
-                modo
-            );
-
-        score += comidaScore;
-
-        /*
-         * Quando a vida esta baixa, reforca novamente
-         * a prioridade da comida.
-         */
-        if (modo == Modo.SOBREVIVER) {
-            score += comidaScore;
+        int manhattan(int a, int b) {
+            return Math.abs(a % w - b % w) + Math.abs(a / w - b / w);
         }
-
-        // =====================================================
-        // 3. TERRITORIALIDADE
-        // =====================================================
-
-        if (enemy != null) {
-
-            score +=
-                avaliarTerritorialidade(
-                    state,
-                    me,
-                    enemy,
-                    next
-                );
-
-            score +=
-                avaliarReducaoTerritorial(
-                    state,
-                    me,
-                    enemy,
-                    next
-                );
-
-            // =================================================
-            // 4. ABATE OPORTUNISTA
-            // =================================================
-
-            score +=
-                avaliarAbate(
-                    state,
-                    me,
-                    enemy,
-                    next
-                );
-        }
-
-        return score;
     }
 
     // =========================================================
-    // COMIDA
+    // MODELO INTERNO DO JOGO
     // =========================================================
 
-    private static int avaliarComida(
-        GameState state,
-        Snake me,
-        Coordinate next,
-        Coordinate target,
-        Modo modo
-    ) {
+    /** Cobra imutavel. body[0] e a cabeca. Segmentos empilhados aparecem repetidos. */
+    private static final class Snk {
 
-        if (target == null) {
-            return 0;
+        final int[] body;
+        final int health;
+        final boolean alive;
+
+        Snk(int[] body, int health, boolean alive) {
+            this.body = body;
+            this.health = health;
+            this.alive = alive;
         }
-
-        /*
-         * Comer imediatamente vale bastante.
-         */
-        if (same(next, target)) {
-
-            if (modo == Modo.SOBREVIVER) {
-                return 5000;
-            }
-
-            if (modo == Modo.CRESCER) {
-                return 3500;
-            }
-
-            return 2500;
-        }
-
-        int[][] distances =
-            dijkstra(
-                state,
-                next
-            );
-
-        int distance =
-            distances
-                [target.getY()]
-                [target.getX()];
-
-        if (distance >= INFINITO) {
-            return -500;
-        }
-
-        int weight;
-
-        if (me.getHealth() <= 20) {
-
-            weight = 180;
-
-        } else if (me.getHealth() <= 40) {
-
-            weight = 140;
-
-        } else if (modo == Modo.CRESCER) {
-
-            weight = 110;
-
-        } else {
-
-            /*
-             * Mesmo grande e controlando territorio,
-             * continua procurando alimento.
-             */
-            weight = 75;
-        }
-
-        return
-            Math.max(
-                0,
-                24 - distance
-            ) * weight;
     }
 
-    // =========================================================
-    // ESCOLHA DA FRUTA
-    // =========================================================
+    /** Estado imutavel. snakes[0] e sempre a nossa cobra. */
+    private static final class World {
 
-    private static Coordinate escolherComidaAlvo(
-        GameState state,
-        Snake me,
-        Snake enemy
-    ) {
+        final Geo geo;
+        final boolean[] hazard;
+        final boolean[] food;
+        final Snk[] snakes;
 
-        List<Coordinate> foods =
-            state.getBoard().getFood();
+        World(Geo geo, boolean[] hazard, boolean[] food, Snk[] snakes) {
+            this.geo = geo;
+            this.hazard = hazard;
+            this.food = food;
+            this.snakes = snakes;
+        }
+    }
 
-        if (
-            foods == null ||
-            foods.isEmpty()
-        ) {
+    private static World buildWorld(GameState state) {
+
+        if (state == null || state.getBoard() == null || state.getYou() == null) {
             return null;
         }
 
-        int[][] minhasDistancias =
-            dijkstra(
-                state,
-                me.getHead()
-            );
+        int w = state.getBoard().getWidth();
+        int h = state.getBoard().getHeight();
 
-        int[][] enemyDistances =
-            enemy == null
-                ? null
-                : dijkstra(
-                    state,
-                    enemy.getHead()
-                );
+        Geo geo = new Geo(w, h);
 
-        Coordinate melhor = null;
+        Snake you = state.getYou();
 
-        int melhorCusto =
-            INFINITO;
+        Snk me = toSnk(geo, you);
 
-        for (Coordinate food : foods) {
-
-            int minhaDistancia =
-                minhasDistancias
-                    [food.getY()]
-                    [food.getX()];
-
-            if (minhaDistancia >= INFINITO) {
-                continue;
-            }
-
-            int custo =
-                minhaDistancia;
-
-            /*
-             * Antes descartavamos completamente frutas
-             * disputadas. Agora apenas aumentamos o custo.
-             *
-             * Isso evita ignorar comida desnecessariamente.
-             */
-            if (
-                enemy != null &&
-                enemyDistances != null
-            ) {
-
-                int distanciaInimigo =
-                    enemyDistances
-                        [food.getY()]
-                        [food.getX()];
-
-                if (
-                    enemy.getLength() >=
-                    me.getLength() &&
-                    distanciaInimigo <=
-                    minhaDistancia
-                ) {
-
-                    custo += 6;
-                }
-
-                /*
-                 * Se somos maiores e chegamos juntos,
-                 * a fruta pode inclusive ser interessante.
-                 */
-                if (
-                    me.getLength() >
-                    enemy.getLength() &&
-                    distanciaInimigo ==
-                    minhaDistancia
-                ) {
-
-                    custo -= 2;
-                }
-            }
-
-            if (custo < melhorCusto) {
-
-                melhorCusto =
-                    custo;
-
-                melhor =
-                    food;
-            }
-        }
-
-        return melhor;
-    }
-
-    // =========================================================
-    // TERRITORIALIDADE
-    // =========================================================
-
-    private static int avaliarTerritorialidade(
-        GameState state,
-        Snake me,
-        Snake enemy,
-        Coordinate myNext
-    ) {
-
-        List<Coordinate> enemyMoves =
-            getEnemySurvivingMovesAfterMyMove(
-                state,
-                me,
-                enemy,
-                myNext
-            );
-
-        /*
-         * Se nao existe nenhuma resposta sobrevivente,
-         * o inimigo esta praticamente fechado.
-         */
-        if (enemyMoves.isEmpty()) {
-            return 5000;
-        }
-
-        int melhorEspacoInimigo = 0;
-
-        /*
-         * Sempre consideramos a MELHOR resposta do
-         * adversario.
-         */
-        for (Coordinate enemyNext : enemyMoves) {
-
-            int espaco =
-                floodFill(
-                    state,
-                    enemyNext,
-                    myNext
-                );
-
-            melhorEspacoInimigo =
-                Math.max(
-                    melhorEspacoInimigo,
-                    espaco
-                );
-        }
-
-        int total =
-            state.getBoard().getWidth() *
-            state.getBoard().getHeight();
-
-        /*
-         * Quanto menos espaco o adversario possuir,
-         * melhor para GreenBeetle.
-         */
-        return
-            (total - melhorEspacoInimigo) * 8;
-    }
-
-    // =========================================================
-    // REDUCAO GRADUAL DO TERRITORIO
-    // =========================================================
-
-    private static int avaliarReducaoTerritorial(
-        GameState state,
-        Snake me,
-        Snake enemy,
-        Coordinate myNext
-    ) {
-
-        int territorioAtual =
-            floodFill(
-                state,
-                enemy.getHead(),
-                null
-            );
-
-        List<Coordinate> enemyMoves =
-            getEnemySurvivingMovesAfterMyMove(
-                state,
-                me,
-                enemy,
-                myNext
-            );
-
-        if (enemyMoves.isEmpty()) {
-            return 6500;
-        }
-
-        int melhorTerritorioFuturo = 0;
-
-        for (Coordinate enemyNext : enemyMoves) {
-
-            int territorio =
-                floodFill(
-                    state,
-                    enemyNext,
-                    myNext
-                );
-
-            melhorTerritorioFuturo =
-                Math.max(
-                    melhorTerritorioFuturo,
-                    territorio
-                );
-        }
-
-        int reducao =
-            territorioAtual -
-            melhorTerritorioFuturo;
-
-        /*
-         * Premia fechar gradualmente o mapa.
-         */
-        return reducao * 140;
-    }
-
-    // =========================================================
-    // ABATE
-    // =========================================================
-
-    private static int avaliarAbate(
-        GameState state,
-        Snake me,
-        Snake enemy,
-        Coordinate myNext
-    ) {
-
-        int score = 0;
-
-        List<Coordinate> enemyMoves =
-            getPossibleEnemyMoves(
-                state,
-                enemy
-            );
-
-        if (enemyMoves.isEmpty()) {
-            return 12000;
-        }
-
-        // -----------------------------------------------------
-        // HEAD TO HEAD FAVORAVEL
-        // -----------------------------------------------------
-
-        if (
-            me.getLength() >
-            enemy.getLength()
-        ) {
-
-            for (Coordinate enemyNext : enemyMoves) {
-
-                if (
-                    same(
-                        myNext,
-                        enemyNext
-                    )
-                ) {
-
-                    /*
-                     * Nao significa que o inimigo ira
-                     * necessariamente escolher essa casa,
-                     * mas podemos controlar a regiao.
-                     */
-                    score += 4500;
-                    break;
-                }
-            }
-        }
-
-        // -----------------------------------------------------
-        // VERIFICA SE TODAS AS ROTAS SAO FATAIS
-        // -----------------------------------------------------
-
-        List<Coordinate> survivingMoves =
-            getEnemySurvivingMovesAfterMyMove(
-                state,
-                me,
-                enemy,
-                myNext
-            );
-
-        if (survivingMoves.isEmpty()) {
-            return score + 12000;
-        }
-
-        boolean todasFatais = true;
-
-        for (Coordinate enemyNext : survivingMoves) {
-
-            int space =
-                floodFill(
-                    state,
-                    enemyNext,
-                    myNext
-                );
-
-            /*
-             * Se existe pelo menos uma regiao grande
-             * o suficiente, ainda nao consideramos
-             * morte garantida.
-             */
-            if (space > enemy.getLength()) {
-
-                todasFatais = false;
-                break;
-            }
-        }
-
-        if (todasFatais) {
-            score += 9000;
-        }
-
-        return score;
-    }
-
-    // =========================================================
-    // MOVIMENTOS SEGUROS
-    // =========================================================
-
-    private static List<String> getSafeMoves(
-        GameState state,
-        Snake me,
-        Snake enemy
-    ) {
-
-        List<String> safeMoves =
-            new ArrayList<>(
-                Arrays.asList(
-                    "up",
-                    "down",
-                    "left",
-                    "right"
-                )
-            );
-
-        Coordinate head =
-            me.getHead();
-
-        safeMoves.removeIf(direction -> {
-
-            Coordinate next =
-                move(
-                    head,
-                    direction
-                );
-
-            // Parede.
-            if (!insideBoard(state, next)) {
-                return true;
-            }
-
-            // Corpo.
-            if (occupied(state, next)) {
-                return true;
-            }
-
-            if (enemy == null) {
-                return false;
-            }
-
-            /*
-             * Evita qualquer head-to-head que possa
-             * resultar em derrota ou empate.
-             */
-            List<Coordinate> enemyMoves =
-                getPossibleEnemyMoves(
-                    state,
-                    enemy
-                );
-
-            for (Coordinate enemyNext : enemyMoves) {
-
-                if (
-                    same(
-                        next,
-                        enemyNext
-                    ) &&
-                    me.getLength() <=
-                    enemy.getLength()
-                ) {
-
-                    return true;
-                }
-            }
-
-            return false;
-        });
-
-        return safeMoves;
-    }
-
-    // =========================================================
-    // MOVIMENTOS DO INIMIGO
-    // =========================================================
-
-    private static List<Coordinate> getPossibleEnemyMoves(
-        GameState state,
-        Snake enemy
-    ) {
-
-        List<Coordinate> moves =
-            new ArrayList<>();
-
-        if (enemy == null) {
-            return moves;
-        }
-
-        for (
-            String direction :
-            Arrays.asList(
-                "up",
-                "down",
-                "left",
-                "right"
-            )
-        ) {
-
-            Coordinate next =
-                move(
-                    enemy.getHead(),
-                    direction
-                );
-
-            if (!insideBoard(state, next)) {
-                continue;
-            }
-
-            /*
-             * Evita voltar diretamente para o pescoco.
-             */
-            List<Coordinate> body =
-                enemy.getBody();
-
-            if (
-                body != null &&
-                body.size() >= 2 &&
-                same(
-                    next,
-                    body.get(1)
-                )
-            ) {
-                continue;
-            }
-
-            if (occupied(state, next)) {
-                continue;
-            }
-
-            moves.add(next);
-        }
-
-        return moves;
-    }
-
-    /*
-     * Retorna apenas respostas nas quais o inimigo
-     * continua vivo depois da nossa jogada.
-     */
-    private static List<Coordinate> getEnemySurvivingMovesAfterMyMove(
-        GameState state,
-        Snake me,
-        Snake enemy,
-        Coordinate myNext
-    ) {
-
-        List<Coordinate> surviving =
-            new ArrayList<>();
-
-        List<Coordinate> enemyMoves =
-            getPossibleEnemyMoves(
-                state,
-                enemy
-            );
-
-        for (Coordinate enemyNext : enemyMoves) {
-
-            /*
-             * Head-to-head.
-             */
-            if (same(enemyNext, myNext)) {
-
-                if (
-                    me.getLength() >
-                    enemy.getLength()
-                ) {
-
-                    // O inimigo morreria.
-                    continue;
-                }
-
-                /*
-                 * Se ele for igual ou maior,
-                 * nossa jogada nao deveria ter passado
-                 * pelo getSafeMoves.
-                 */
-                surviving.add(enemyNext);
-                continue;
-            }
-
-            surviving.add(enemyNext);
-        }
-
-        return surviving;
-    }
-
-    // =========================================================
-    // FUTURO DO PROPRIO CORPO
-    // =========================================================
-
-    private static int avaliarFuturoProprio(
-        GameState state,
-        Snake me,
-        Coordinate firstMove,
-        int profundidade
-    ) {
-
-        List<Coordinate> corpo =
-            copiarCorpo(
-                me.getBody()
-            );
-
-        boolean comeu =
-            contains(
-                state.getBoard().getFood(),
-                firstMove
-            );
-
-        List<Coordinate> corpoSimulado =
-            moverCorpoSimulado(
-                corpo,
-                firstMove,
-                comeu
-            );
-
-        if (!corpoValido(corpoSimulado)) {
-            return -10000;
-        }
-
-        int score = 0;
-
-        int saidas =
-            contarSaidasFuturas(
-                state,
-                corpoSimulado,
-                firstMove
-            );
-
-        if (saidas == 0) {
-            return -10000;
-        }
-
-        /*
-        * Cobras pequenas podem usar paredes normalmente.
-        * Ter 2 saidas perto da borda nao significa perigo.
-        */
-        if (me.getLength() <= 7) {
-
-            if (saidas == 1) {
-                score -= 700;
-
-            } else if (saidas == 2) {
-                score += 100;
-
-            } else {
-                score += 200;
-            }
-
-        } else if (me.getLength() <= 10) {
-
-            if (saidas == 1) {
-                score -= 1400;
-
-            } else if (saidas == 2) {
-                score -= 50;
-
-            } else {
-                score += 200;
-            }
-
-        } else {
-
-            /*
-            * Cobra grande precisa de mais cuidado,
-            * porque o proprio corpo ocupa muito espaco.
-            */
-            if (saidas == 1) {
-                score -= 2500;
-
-            } else if (saidas == 2) {
-                score -= 350;
-
-            } else {
-                score += 200;
-            }
-        }
-
-        int profundidadeAlcancada =
-            preverSobrevivencia(
-                state,
-                corpoSimulado,
-                profundidade - 1
-            );
-
-        if (
-            profundidadeAlcancada <
-            profundidade - 1
-        ) {
-
-            score -=
-                3000 -
-                profundidadeAlcancada * 300;
-
-        } else {
-
-            score +=
-                profundidadeAlcancada * 150;
-        }
-
-        return score;
-    }
-
-    private static int preverSobrevivencia(
-        GameState state,
-        List<Coordinate> corpo,
-        int profundidade
-    ) {
-
-        if (profundidade <= 0) {
-            return 0;
-        }
-
-        Coordinate head =
-            corpo.get(0);
-
-        int melhor = -1;
-
-        for (
-            String direction :
-            Arrays.asList(
-                "up",
-                "down",
-                "left",
-                "right"
-            )
-        ) {
-
-            Coordinate next =
-                move(
-                    head,
-                    direction
-                );
-
-            if (!insideBoard(state, next)) {
-                continue;
-            }
-
-            boolean comeu =
-                contains(
-                    state.getBoard().getFood(),
-                    next
-                );
-
-            /*
-             * Se nao comer, a cauda se move e pode
-             * ser considerada livre.
-             */
-            if (
-                colisaoComCorpoSimulado(
-                    corpo,
-                    next,
-                    !comeu
-                )
-            ) {
-                continue;
-            }
-
-            if (
-                ocupadoPorInimigo(
-                    state,
-                    next
-                )
-            ) {
-                continue;
-            }
-
-            List<Coordinate> novoCorpo =
-                moverCorpoSimulado(
-                    corpo,
-                    next,
-                    comeu
-                );
-
-            if (!corpoValido(novoCorpo)) {
-                continue;
-            }
-
-            int resultado =
-                preverSobrevivencia(
-                    state,
-                    novoCorpo,
-                    profundidade - 1
-                );
-
-            melhor =
-                Math.max(
-                    melhor,
-                    resultado
-                );
-        }
-
-        if (melhor < 0) {
-            return 0;
-        }
-
-        return 1 + melhor;
-    }
-
-    // =========================================================
-    // SAIDAS FUTURAS
-    // =========================================================
-
-    private static int contarSaidasFuturas(
-        GameState state,
-        List<Coordinate> corpo,
-        Coordinate head
-    ) {
-
-        int saidas = 0;
-
-        for (
-            String direction :
-            Arrays.asList(
-                "up",
-                "down",
-                "left",
-                "right"
-            )
-        ) {
-
-            Coordinate next =
-                move(
-                    head,
-                    direction
-                );
-
-            if (!insideBoard(state, next)) {
-                continue;
-            }
-
-            boolean comeu =
-                contains(
-                    state.getBoard().getFood(),
-                    next
-                );
-
-            if (
-                colisaoComCorpoSimulado(
-                    corpo,
-                    next,
-                    !comeu
-                )
-            ) {
-                continue;
-            }
-
-            if (
-                ocupadoPorInimigo(
-                    state,
-                    next
-                )
-            ) {
-                continue;
-            }
-
-            saidas++;
-        }
-
-        return saidas;
-    }
-
-    // =========================================================
-    // SIMULACAO DO CORPO
-    // =========================================================
-
-    private static List<Coordinate> moverCorpoSimulado(
-        List<Coordinate> corpo,
-        Coordinate novaCabeca,
-        boolean comeu
-    ) {
-
-        List<Coordinate> novo =
-            copiarCorpo(corpo);
-
-        novo.add(
-            0,
-            coordinate(
-                novaCabeca.getX(),
-                novaCabeca.getY()
-            )
-        );
-
-        if (
-            !comeu &&
-            !novo.isEmpty()
-        ) {
-            novo.remove(
-                novo.size() - 1
-            );
-        }
-
-        return novo;
-    }
-
-    private static List<Coordinate> copiarCorpo(
-        List<Coordinate> corpo
-    ) {
-
-        List<Coordinate> copia =
-            new ArrayList<>();
-
-        if (corpo == null) {
-            return copia;
-        }
-
-        for (Coordinate parte : corpo) {
-
-            copia.add(
-                coordinate(
-                    parte.getX(),
-                    parte.getY()
-                )
-            );
-        }
-
-        return copia;
-    }
-
-    private static boolean colisaoComCorpoSimulado(
-        List<Coordinate> corpo,
-        Coordinate position,
-        boolean caudaVaiMover
-    ) {
-
-        if (
-            corpo == null ||
-            corpo.isEmpty()
-        ) {
-            return false;
-        }
-
-        int limite =
-            corpo.size();
-
-        if (caudaVaiMover) {
-            limite--;
-        }
-
-        for (int i = 0; i < limite; i++) {
-
-            if (
-                same(
-                    corpo.get(i),
-                    position
-                )
-            ) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static boolean corpoValido(
-        List<Coordinate> corpo
-    ) {
-
-        for (
-            int i = 0;
-            i < corpo.size();
-            i++
-        ) {
-
-            for (
-                int j = i + 1;
-                j < corpo.size();
-                j++
-            ) {
-
-                if (
-                    same(
-                        corpo.get(i),
-                        corpo.get(j)
-                    )
-                ) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    // =========================================================
-    // DIJKSTRA
-    // =========================================================
-
-    private static int[][] dijkstra(
-        GameState state,
-        Coordinate start
-    ) {
-
-        int width =
-            state.getBoard().getWidth();
-
-        int height =
-            state.getBoard().getHeight();
-
-        int[][] distance =
-            new int[height][width];
-
-        for (int[] row : distance) {
-            Arrays.fill(
-                row,
-                INFINITO
-            );
-        }
-
-        PriorityQueue<Node> queue =
-            new PriorityQueue<>(
-                Comparator.comparingInt(
-                    node -> node.distance
-                )
-            );
-
-        distance
-            [start.getY()]
-            [start.getX()] = 0;
-
-        queue.add(
-            new Node(
-                start.getX(),
-                start.getY(),
-                0
-            )
-        );
-
-        while (!queue.isEmpty()) {
-
-            Node current =
-                queue.poll();
-
-            if (
-                current.distance !=
-                distance[current.y][current.x]
-            ) {
-                continue;
-            }
-
-            for (int[] direction : DIRECTIONS) {
-
-                int nx =
-                    current.x +
-                    direction[0];
-
-                int ny =
-                    current.y +
-                    direction[1];
-
-                Coordinate next =
-                    coordinate(
-                        nx,
-                        ny
-                    );
-
-                if (!insideBoard(state, next)) {
-                    continue;
-                }
-
-                if (
-                    occupied(state, next) &&
-                    !same(next, start)
-                ) {
-                    continue;
-                }
-
-                int cost = 1;
-
-                if (isHazard(state, next)) {
-                    cost += 15;
-                }
-
-                int newDistance =
-                    current.distance +
-                    cost;
-
-                if (
-                    newDistance <
-                    distance[ny][nx]
-                ) {
-
-                    distance[ny][nx] =
-                        newDistance;
-
-                    queue.add(
-                        new Node(
-                            nx,
-                            ny,
-                            newDistance
-                        )
-                    );
-                }
-            }
-        }
-
-        return distance;
-    }
-
-    // =========================================================
-    // FLOOD FILL
-    // =========================================================
-
-    private static int floodFill(
-        GameState state,
-        Coordinate start,
-        Coordinate extraBlocked
-    ) {
-
-        int width =
-            state.getBoard().getWidth();
-
-        int height =
-            state.getBoard().getHeight();
-
-        boolean[][] visited =
-            new boolean[height][width];
-
-        Queue<Coordinate> queue =
-            new ArrayDeque<>();
-
-        queue.add(start);
-
-        visited
-            [start.getY()]
-            [start.getX()] = true;
-
-        int space = 0;
-
-        while (!queue.isEmpty()) {
-
-            Coordinate current =
-                queue.poll();
-
-            space++;
-
-            for (int[] direction : DIRECTIONS) {
-
-                Coordinate next =
-                    coordinate(
-                        current.getX() +
-                            direction[0],
-                        current.getY() +
-                            direction[1]
-                    );
-
-                if (!insideBoard(state, next)) {
-                    continue;
-                }
-
-                if (
-                    visited
-                        [next.getY()]
-                        [next.getX()]
-                ) {
-                    continue;
-                }
-
-                if (
-                    extraBlocked != null &&
-                    same(
-                        next,
-                        extraBlocked
-                    )
-                ) {
-                    continue;
-                }
-
-                if (
-                    occupied(state, next) &&
-                    !same(next, start)
-                ) {
-                    continue;
-                }
-
-                visited
-                    [next.getY()]
-                    [next.getX()] = true;
-
-                queue.add(next);
-            }
-        }
-
-        return space;
-    }
-
-    // =========================================================
-    // INIMIGO
-    // =========================================================
-
-    private static Snake encontrarPrincipalInimigo(
-        GameState state
-    ) {
-
-        if (
-            state.getBoard() == null ||
-            state.getBoard().getSnakes() == null
-        ) {
+        if (me == null) {
             return null;
         }
 
-        Snake me =
-            state.getYou();
+        List<Snk> all = new ArrayList<>();
+        all.add(me);
 
-        Snake target = null;
+        List<Snake> boardSnakes = state.getBoard().getSnakes();
 
-        for (
-            Snake snake :
-            state.getBoard().getSnakes()
-        ) {
+        if (boardSnakes != null) {
 
-            if (
-                me.getId() != null &&
-                me.getId().equals(
-                    snake.getId()
-                )
-            ) {
-                continue;
-            }
+            for (Snake other : boardSnakes) {
 
-            if (
-                target == null ||
-                snake.getLength() <
-                target.getLength()
-            ) {
-                target = snake;
+                if (isSameSnake(you, other)) {
+                    continue;
+                }
+
+                Snk snk = toSnk(geo, other);
+
+                if (snk != null) {
+                    all.add(snk);
+                }
             }
         }
 
-        return target;
+        boolean[] food = new boolean[geo.cells];
+        boolean[] hazard = new boolean[geo.cells];
+
+        mark(geo, state.getBoard().getFood(), food);
+        mark(geo, state.getBoard().getHazards(), hazard);
+
+        return new World(geo, hazard, food, all.toArray(new Snk[0]));
     }
 
-    // =========================================================
-    // OCUPACAO
-    // =========================================================
+    private static boolean isSameSnake(Snake you, Snake other) {
 
-    private static boolean occupied(
-        GameState state,
-        Coordinate position
-    ) {
-
-        if (
-            state.getYou() != null &&
-            contains(
-                state.getYou().getBody(),
-                position
-            )
-        ) {
+        if (you.getId() != null && you.getId().equals(other.getId())) {
             return true;
         }
 
-        if (
-            state.getBoard() == null ||
-            state.getBoard().getSnakes() == null
-        ) {
-            return false;
-        }
+        if (you.getId() == null && other.getId() == null
+            && you.getBody() != null && other.getBody() != null
+            && !you.getBody().isEmpty() && !other.getBody().isEmpty()) {
 
-        for (
-            Snake snake :
-            state.getBoard().getSnakes()
-        ) {
+            Coordinate a = you.getBody().get(0);
+            Coordinate b = other.getBody().get(0);
 
-            if (
-                contains(
-                    snake.getBody(),
-                    position
-                )
-            ) {
-                return true;
-            }
+            return a.getX() == b.getX() && a.getY() == b.getY();
         }
 
         return false;
     }
 
-    private static boolean ocupadoPorInimigo(
-        GameState state,
-        Coordinate position
-    ) {
+    private static Snk toSnk(Geo geo, Snake snake) {
 
-        if (
-            state.getBoard() == null ||
-            state.getBoard().getSnakes() == null
-        ) {
-            return false;
+        List<Coordinate> body = snake.getBody();
+
+        if (body == null || body.isEmpty()) {
+            return null;
         }
 
-        Snake me =
-            state.getYou();
+        int[] cells = new int[body.size()];
 
-        for (
-            Snake snake :
-            state.getBoard().getSnakes()
-        ) {
+        for (int i = 0; i < cells.length; i++) {
 
-            if (
-                me != null &&
-                me.getId() != null &&
-                me.getId().equals(
-                    snake.getId()
-                )
-            ) {
-                continue;
+            Coordinate c = body.get(i);
+
+            if (c.getX() < 0 || c.getY() < 0
+                || c.getX() >= geo.w || c.getY() >= geo.h) {
+                return null;
             }
 
-            if (
-                contains(
-                    snake.getBody(),
-                    position
-                )
-            ) {
-                return true;
+            cells[i] = c.getY() * geo.w + c.getX();
+        }
+
+        return new Snk(cells, snake.getHealth(), true);
+    }
+
+    private static void mark(Geo geo, List<Coordinate> list, boolean[] target) {
+
+        if (list == null) {
+            return;
+        }
+
+        for (Coordinate c : list) {
+
+            if (c.getX() >= 0 && c.getY() >= 0
+                && c.getX() < geo.w && c.getY() < geo.h) {
+
+                target[c.getY() * geo.w + c.getX()] = true;
+            }
+        }
+    }
+
+    // =========================================================
+    // BUSCA
+    // =========================================================
+
+    private static final class Search {
+
+        final Geo geo;
+        final World root;
+        final long deadline;
+        final boolean hadOpponents;
+
+        // Buffers reutilizaveis (a busca e single-thread).
+        final int[] release;
+        final int[][] dist;
+        final int[] queue;
+
+        boolean timeUp;
+        long nodes;
+
+        int[] rootOrder;
+        int rootBestMove;
+
+        Search(World root, long deadline) {
+            this.geo = root.geo;
+            this.root = root;
+            this.deadline = deadline;
+            this.hadOpponents = root.snakes.length > 1;
+
+            this.release = new int[geo.cells];
+            this.dist = new int[root.snakes.length][geo.cells];
+            this.queue = new int[geo.cells];
+        }
+
+        // -----------------------------------------------------
+        // Aprofundamento iterativo
+        // -----------------------------------------------------
+
+        int run() {
+
+            int[] candidates = legalMoves(root, 0, computeRelease(root));
+
+            if (candidates.length == 1) {
+                return candidates[0];
+            }
+
+            rootOrder = candidates;
+
+            int best = candidates[0];
+
+            for (int depth = 1; depth <= MAX_DEPTH; depth++) {
+
+                rootBestMove = -1;
+
+                int value = value(root, depth, -INF, INF, true);
+
+                if (timeUp) {
+                    break;
+                }
+
+                if (rootBestMove >= 0) {
+                    best = rootBestMove;
+                    moveToFront(best);
+                }
+
+                // Vitoria forcada encontrada: nao ha o que melhorar.
+                if (value >= WIN) {
+                    break;
+                }
+            }
+
+            return best;
+        }
+
+        void moveToFront(int move) {
+
+            int[] order = new int[rootOrder.length];
+            int c = 0;
+
+            order[c++] = move;
+
+            for (int m : rootOrder) {
+                if (m != move) {
+                    order[c++] = m;
+                }
+            }
+
+            rootOrder = order;
+        }
+
+        // -----------------------------------------------------
+        // Minimax com movimentos simultaneos (alpha-beta)
+        //
+        // valor(no) = max sobre meus movimentos de
+        //             min sobre as respostas conjuntas dos inimigos
+        // -----------------------------------------------------
+
+        int value(World s, int depth, int alpha, int beta, boolean isRoot) {
+
+            if (timeUp) {
+                return 0;
+            }
+
+            if ((++nodes & 127L) == 0 && System.nanoTime() >= deadline) {
+                timeUp = true;
+                return 0;
+            }
+
+            int n = s.snakes.length;
+
+            int alive = 0;
+
+            for (int i = 1; i < n; i++) {
+                if (s.snakes[i].alive) {
+                    alive++;
+                }
+            }
+
+            if (!s.snakes[0].alive) {
+                return (hadOpponents && alive == 0) ? DRAW : LOSS - depth;
+            }
+
+            if (hadOpponents && alive == 0) {
+                return WIN + depth;
+            }
+
+            if (depth == 0) {
+                return eval(s);
+            }
+
+            int[] rel = computeRelease(s);
+
+            int[] myMoves = isRoot ? rootOrder : legalMoves(s, 0, rel);
+
+            // Inimigos ordenados por proximidade da nossa cabeca.
+            int[] order = new int[alive];
+            int c = 0;
+
+            for (int i = 1; i < n; i++) {
+                if (s.snakes[i].alive) {
+                    order[c++] = i;
+                }
+            }
+
+            int myHead = s.snakes[0].body[0];
+
+            for (int a = 1; a < order.length; a++) {
+
+                int key = order[a];
+                int keyDist = geo.manhattan(s.snakes[key].body[0], myHead);
+                int b = a - 1;
+
+                while (b >= 0
+                    && geo.manhattan(s.snakes[order[b]].body[0], myHead) > keyDist) {
+
+                    order[b + 1] = order[b];
+                    b--;
+                }
+
+                order[b + 1] = key;
+            }
+
+            int k = Math.min(alive, FULL_BRANCH_OPPONENTS);
+
+            int[] fullIdx = new int[k];
+            int[][] fullMoves = new int[k][];
+            int[] mv = new int[n];
+
+            Arrays.fill(mv, -1);
+
+            for (int j = 0; j < alive; j++) {
+
+                int snakeIndex = order[j];
+
+                if (j < k) {
+                    fullIdx[j] = snakeIndex;
+                    fullMoves[j] = legalMoves(s, snakeIndex, rel);
+                } else {
+                    mv[snakeIndex] = heuristicMove(s, snakeIndex, rel);
+                }
+            }
+
+            int best = -INF;
+            int[] pos = new int[k];
+
+            for (int m : myMoves) {
+
+                mv[0] = m;
+
+                Arrays.fill(pos, 0);
+
+                int cur = INF;
+
+                while (true) {
+
+                    for (int j = 0; j < k; j++) {
+                        mv[fullIdx[j]] = fullMoves[j][pos[j]];
+                    }
+
+                    World child = step(s, mv);
+
+                    int v = value(child, depth - 1, alpha, Math.min(beta, cur), false);
+
+                    if (timeUp) {
+                        return 0;
+                    }
+
+                    if (v < cur) {
+                        cur = v;
+                    }
+
+                    if (cur <= alpha) {
+                        break;
+                    }
+
+                    // Proxima combinacao de respostas (odometro).
+                    int j = k - 1;
+
+                    while (j >= 0) {
+
+                        pos[j]++;
+
+                        if (pos[j] < fullMoves[j].length) {
+                            break;
+                        }
+
+                        pos[j] = 0;
+                        j--;
+                    }
+
+                    if (j < 0) {
+                        break;
+                    }
+                }
+
+                if (cur > best) {
+
+                    best = cur;
+
+                    if (isRoot) {
+                        rootBestMove = m;
+                    }
+                }
+
+                if (best > alpha) {
+                    alpha = best;
+                }
+
+                if (alpha >= beta) {
+                    break;
+                }
+            }
+
+            return best;
+        }
+
+        // -----------------------------------------------------
+        // Geracao de movimentos
+        // -----------------------------------------------------
+
+        /**
+         * Movimentos que nao matam imediatamente por parede ou corpo.
+         * Uma casa so esta bloqueada se ainda estiver ocupada depois do proximo
+         * turno: o rabo comum sai do lugar, o rabo "empilhado" (cobra que acabou
+         * de comer) nao.
+         *
+         * Se todos os movimentos matam, devolve um unico movimento (a cobra morre
+         * na simulacao).
+         */
+        int[] legalMoves(World s, int i, int[] rel) {
+
+            int[] body = s.snakes[i].body;
+            int head = body[0];
+
+            int[] result = new int[4];
+            int c = 0;
+            int anyDir = -1;
+
+            for (int d = 0; d < 4; d++) {
+
+                int next = geo.nbr[head][d];
+
+                if (next < 0) {
+                    continue;
+                }
+
+                if (anyDir < 0) {
+                    anyDir = d;
+                }
+
+                if (body.length > 1 && next == body[1]) {
+                    continue;
+                }
+
+                if (rel[next] > 1) {
+                    continue;
+                }
+
+                result[c++] = d;
+            }
+
+            if (c == 0) {
+                return new int[] {anyDir < 0 ? 0 : anyDir};
+            }
+
+            return Arrays.copyOf(result, c);
+        }
+
+        /** Movimento unico e barato para inimigos distantes (nao ramificados). */
+        int heuristicMove(World s, int i, int[] rel) {
+
+            int[] legal = legalMoves(s, i, rel);
+
+            Snk snake = s.snakes[i];
+            int head = snake.body[0];
+
+            int bestDir = legal[0];
+            int bestScore = Integer.MIN_VALUE;
+
+            for (int d : legal) {
+
+                int next = geo.nbr[head][d];
+
+                if (next < 0) {
+                    continue;
+                }
+
+                int score = 0;
+
+                for (int e = 0; e < 4; e++) {
+
+                    int around = geo.nbr[next][e];
+
+                    if (around >= 0 && rel[around] <= 1) {
+                        score += 10;
+                    }
+                }
+
+                if (s.food[next]) {
+                    score += snake.health < 50 ? 25 : 8;
+                }
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestDir = d;
+                }
+            }
+
+            return bestDir;
+        }
+
+        // -----------------------------------------------------
+        // Simulacao exata de um turno
+        // Ordem oficial: mover, reduzir vida, hazard, comer, eliminar.
+        // -----------------------------------------------------
+
+        World step(World s, int[] mv) {
+
+            int n = s.snakes.length;
+
+            int[][] body = new int[n][];
+            int[] health = new int[n];
+            boolean[] contender = new boolean[n];
+            boolean[] dead = new boolean[n];
+            boolean[] ate = new boolean[n];
+
+            boolean[] food = s.food;
+            boolean foodCopied = false;
+
+            for (int i = 0; i < n; i++) {
+
+                Snk sn = s.snakes[i];
+
+                if (!sn.alive) {
+                    dead[i] = true;
+                    body[i] = sn.body;
+                    continue;
+                }
+
+                int next = mv[i] >= 0 ? geo.nbr[sn.body[0]][mv[i]] : -1;
+                int len = sn.body.length;
+
+                if (next < 0) {
+                    // Saiu do tabuleiro.
+                    dead[i] = true;
+                    body[i] = sn.body;
+                    continue;
+                }
+
+                int[] nb = new int[len];
+                nb[0] = next;
+                System.arraycopy(sn.body, 0, nb, 1, len - 1);
+                body[i] = nb;
+
+                int hp = sn.health - 1;
+
+                if (s.food[next]) {
+                    ate[i] = true;
+                    hp = 100;
+                } else if (s.hazard[next]) {
+                    hp -= HAZARD_DAMAGE;
+                }
+
+                health[i] = hp;
+
+                if (hp <= 0) {
+                    dead[i] = true;
+                    continue;
+                }
+
+                contender[i] = true;
+            }
+
+            // Crescimento e remocao da comida.
+            for (int i = 0; i < n; i++) {
+
+                if (!ate[i]) {
+                    continue;
+                }
+
+                int[] nb = body[i];
+
+                body[i] = Arrays.copyOf(nb, nb.length + 1);
+                body[i][nb.length] = nb[nb.length - 1];
+
+                if (!foodCopied) {
+                    food = food.clone();
+                    foodCopied = true;
+                }
+
+                food[nb[0]] = false;
+            }
+
+            // Colisoes (todas calculadas sobre o mesmo estado, ao mesmo tempo).
+            boolean[] kill = new boolean[n];
+
+            for (int i = 0; i < n; i++) {
+
+                if (!contender[i]) {
+                    continue;
+                }
+
+                int head = body[i][0];
+
+                for (int j = 0; j < n && !kill[i]; j++) {
+
+                    if (!contender[j]) {
+                        continue;
+                    }
+
+                    int[] other = body[j];
+
+                    for (int k = 1; k < other.length; k++) {
+                        if (other[k] == head) {
+                            kill[i] = true;
+                            break;
+                        }
+                    }
+
+                    if (!kill[i] && j != i
+                        && other[0] == head
+                        && other.length >= body[i].length) {
+
+                        kill[i] = true;
+                    }
+                }
+            }
+
+            Snk[] next = new Snk[n];
+
+            for (int i = 0; i < n; i++) {
+
+                boolean isAlive = s.snakes[i].alive && !dead[i] && !kill[i];
+
+                next[i] = isAlive
+                    ? new Snk(body[i], health[i], true)
+                    : new Snk(body[i], 0, false);
+            }
+
+            return new World(geo, s.hazard, food, next);
+        }
+
+        // -----------------------------------------------------
+        // Estruturas auxiliares da avaliacao
+        // -----------------------------------------------------
+
+        /**
+         * release[casa] = quantos turnos ate a casa ficar livre
+         * (0 = ja esta livre; 1 = e um rabo que sai neste turno).
+         */
+        int[] computeRelease(World s) {
+
+            Arrays.fill(release, 0);
+
+            for (Snk sn : s.snakes) {
+
+                if (!sn.alive) {
+                    continue;
+                }
+
+                int len = sn.body.length;
+
+                for (int k = 0; k < len; k++) {
+
+                    int r = len - k;
+                    int cell = sn.body[k];
+
+                    if (r > release[cell]) {
+                        release[cell] = r;
+                    }
+                }
+            }
+
+            return release;
+        }
+
+        /** Distancia (em turnos) ate cada casa, respeitando rabos que vao sair. */
+        void bfs(World s, int i, int[] rel) {
+
+            int[] d = dist[i];
+
+            Arrays.fill(d, UNREACHABLE);
+
+            int head = s.snakes[i].body[0];
+
+            d[head] = 0;
+
+            int qh = 0;
+            int qt = 0;
+
+            queue[qt++] = head;
+
+            while (qh < qt) {
+
+                int cell = queue[qh++];
+                int nd = d[cell] + 1;
+
+                for (int e = 0; e < 4; e++) {
+
+                    int nn = geo.nbr[cell][e];
+
+                    if (nn < 0 || d[nn] != UNREACHABLE) {
+                        continue;
+                    }
+
+                    if (rel[nn] > nd) {
+                        continue;
+                    }
+
+                    d[nn] = nd;
+                    queue[qt++] = nn;
+                }
             }
         }
 
-        return false;
-    }
+        // -----------------------------------------------------
+        // Avaliacao de uma posicao (do nosso ponto de vista)
+        // -----------------------------------------------------
 
-    private static boolean isHazard(
-        GameState state,
-        Coordinate position
-    ) {
+        int eval(World s) {
 
-        return
-            state.getBoard().getHazards() != null &&
-            contains(
-                state.getBoard().getHazards(),
-                position
-            );
-    }
+            int n = s.snakes.length;
 
-    // =========================================================
-    // MOVIMENTO
-    // =========================================================
+            int[] rel = computeRelease(s);
 
-    private static Coordinate move(
-        Coordinate position,
-        String direction
-    ) {
-
-        int x =
-            position.getX();
-
-        int y =
-            position.getY();
-
-        switch (direction) {
-
-            case "up":
-                y++;
-                break;
-
-            case "down":
-                y--;
-                break;
-
-            case "left":
-                x--;
-                break;
-
-            case "right":
-                x++;
-                break;
-
-            default:
-                break;
-        }
-
-        return coordinate(
-            x,
-            y
-        );
-    }
-
-    private static String emergencyMove(
-        GameState state,
-        Snake me
-    ) {
-
-        for (
-            String direction :
-            Arrays.asList(
-                "up",
-                "down",
-                "left",
-                "right"
-            )
-        ) {
-
-            Coordinate next =
-                move(
-                    me.getHead(),
-                    direction
-                );
-
-            if (
-                insideBoard(state, next) &&
-                !occupied(state, next)
-            ) {
-                return direction;
+            for (int i = 0; i < n; i++) {
+                if (s.snakes[i].alive) {
+                    bfs(s, i, rel);
+                }
             }
-        }
 
-        return "up";
-    }
+            // Territorio (Voronoi): cada casa pertence a quem chega primeiro.
+            // Empate de distancia: vence a cobra estritamente maior, senao ninguem.
+            int[] territory = new int[n];
 
-    // =========================================================
-    // AUXILIARES
-    // =========================================================
+            for (int c = 0; c < geo.cells; c++) {
 
-    private static Coordinate coordinate(
-        int x,
-        int y
-    ) {
+                int bestD = UNREACHABLE;
 
-        Coordinate coordinate =
-            new Coordinate();
+                for (int i = 0; i < n; i++) {
+                    if (s.snakes[i].alive && dist[i][c] < bestD) {
+                        bestD = dist[i][c];
+                    }
+                }
 
-        coordinate.setX(x);
-        coordinate.setY(y);
+                if (bestD >= UNREACHABLE) {
+                    continue;
+                }
 
-        return coordinate;
-    }
+                int winner = -1;
+                int winnerLen = -1;
+                boolean unique = true;
 
-    private static boolean insideBoard(
-        GameState state,
-        Coordinate position
-    ) {
+                for (int i = 0; i < n; i++) {
 
-        return
-            position.getX() >= 0 &&
-            position.getY() >= 0 &&
-            position.getX() <
-                state.getBoard().getWidth() &&
-            position.getY() <
-                state.getBoard().getHeight();
-    }
+                    if (!s.snakes[i].alive || dist[i][c] != bestD) {
+                        continue;
+                    }
 
-    private static boolean contains(
-        List<Coordinate> coordinates,
-        Coordinate target
-    ) {
+                    int len = s.snakes[i].body.length;
 
-        if (coordinates == null) {
-            return false;
-        }
+                    if (len > winnerLen) {
+                        winnerLen = len;
+                        winner = i;
+                        unique = true;
+                    } else if (len == winnerLen) {
+                        unique = false;
+                    }
+                }
 
-        for (
-            Coordinate coordinate :
-            coordinates
-        ) {
-
-            if (
-                same(
-                    coordinate,
-                    target
-                )
-            ) {
-                return true;
+                if (unique) {
+                    territory[winner]++;
+                }
             }
-        }
 
-        return false;
-    }
+            Snk me = s.snakes[0];
+            int myLen = me.body.length;
 
-    private static boolean same(
-        Coordinate first,
-        Coordinate second
-    ) {
+            int oppMaxCells = 0;
+            int oppMaxLen = 0;
 
-        return
-            first != null &&
-            second != null &&
-            first.getX() ==
-                second.getX() &&
-            first.getY() ==
-                second.getY();
-    }
+            for (int i = 1; i < n; i++) {
 
-    // =========================================================
-    // NODE
-    // =========================================================
+                if (!s.snakes[i].alive) {
+                    continue;
+                }
 
-    private static class Node {
+                oppMaxCells = Math.max(oppMaxCells, territory[i]);
+                oppMaxLen = Math.max(oppMaxLen, s.snakes[i].body.length);
+            }
 
-        int x;
-        int y;
-        int distance;
+            // Espaco que consigo alcancar ignorando os inimigos.
+            int selfSpace = 0;
+            int foodDist = UNREACHABLE;
 
-        Node(
-            int x,
-            int y,
-            int distance
-        ) {
-            this.x = x;
-            this.y = y;
-            this.distance = distance;
+            for (int c = 0; c < geo.cells; c++) {
+
+                int d = dist[0][c];
+
+                if (d >= UNREACHABLE) {
+                    continue;
+                }
+
+                selfSpace++;
+
+                if (s.food[c] && d < foodDist) {
+                    foodDist = d;
+                }
+            }
+
+            int score = 0;
+
+            // Territorio: o que mais separa cobras fortes de fracas.
+            score += 16 * territory[0] - 6 * oppMaxCells;
+
+            // Tamanho: ser maior vence os head-to-head.
+            int diff = oppMaxLen == 0
+                ? 0
+                : Math.max(-4, Math.min(4, myLen - oppMaxLen));
+
+            score += 25 * diff + 6 * myLen;
+
+            // Armadilha: regiao menor que o proprio corpo.
+            if (selfSpace < myLen) {
+                score -= 3000 + 300 * (myLen - selfSpace);
+            }
+
+            // Fome: nao consegue chegar a nenhuma comida a tempo.
+            if (me.health < foodDist) {
+                score -= 25_000;
+            }
+
+            if (me.health < 35) {
+                score -= (35 - me.health) * 20;
+            }
+
+            int pull = 2
+                + (me.health < 60 ? (60 - me.health) / 4 : 0)
+                + (diff <= 0 ? 2 : 0);
+
+            score -= pull * Math.min(foodDist, 25);
+
+            if (s.hazard[me.body[0]]) {
+                score -= 60;
+            }
+
+            return score;
         }
     }
 }
