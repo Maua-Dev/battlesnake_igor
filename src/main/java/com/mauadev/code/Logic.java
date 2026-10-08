@@ -5,6 +5,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 
 import com.mauadev.code.entities.Coordinate;
 import com.mauadev.code.entities.GameState;
@@ -15,14 +16,16 @@ import com.mauadev.code.entities.Snake;
  *
  * Ideia geral:
  *  1. O estado do jogo e convertido em um modelo interno que simula as regras
- *     oficiais (movimento, rabo que sai, comida, hazard, colisoes, head-to-head).
+ *     de movimento, rabo que sai, comida, hazard, colisoes e head-to-head.
  *  2. Uma busca com aprofundamento iterativo (minimax com movimentos simultaneos
  *     e poda alpha-beta) escolhe o movimento que da o melhor resultado no pior
- *     caso, considerando TODAS as cobras inimigas.
+ *     caso. Os dois inimigos mais proximos e todas as ameacas imediatas sao
+ *     ramificados. Uma tabela local reutiliza apenas a ordem dos movimentos.
  *  3. Nas folhas, o estado e avaliado por territorio (Voronoi), espaco
  *     alcancavel, tamanho relativo, fome e distancia da comida.
  *
  * Nao ha estado estatico mutavel: varias partidas podem ser jogadas em paralelo.
+ * Comida futura e expansao aleatoria de hazards nao sao previstas na busca.
  */
 public class Logic {
 
@@ -30,9 +33,8 @@ public class Logic {
     // CONFIGURACAO
     // =========================================================
 
-    /** Tempo maximo de busca por jogada (o limite do Battlesnake e 500 ms). */
-    private static final long TIME_BUDGET_NANOS =
-        Long.getLong("snake.budget.ms", 300L) * 1_000_000L;
+    /** Limite configuravel, sempre reduzido para caber no timeout da partida. */
+    private static final long DEFAULT_BUDGET_MS = 300L;
 
     private static final int MAX_DEPTH = 24;
 
@@ -80,7 +82,7 @@ public class Logic {
 
     public static String getMove(GameState state) {
 
-        long deadline = System.nanoTime() + TIME_BUDGET_NANOS;
+        long deadline = System.nanoTime() + searchBudgetNanos(state);
         World world = null;
 
         try {
@@ -94,12 +96,11 @@ public class Logic {
 
         } catch (RuntimeException e) {
 
-            // Nunca devolve erro HTTP por causa de um bug: joga o movimento
-            // legal mais simples.
+            // Se a busca falhar, usa a mesma avaliacao de emergencia.
             try {
                 if (world != null) {
-                    Search s = new Search(world, Long.MAX_VALUE);
-                    return NAMES[s.legalMoves(world, 0, s.computeRelease(world))[0]];
+                    Search s = new Search(world, System.nanoTime());
+                    return NAMES[s.fallbackMove(world)];
                 }
             } catch (RuntimeException ignored) {
                 // cai no retorno padrao
@@ -109,12 +110,24 @@ public class Logic {
         }
     }
 
+    static long searchBudgetNanos(GameState state) {
+        int timeout = state != null && state.getGame() != null
+            ? state.getGame().getTimeout() : 500;
+        if (timeout <= 0) {
+            timeout = 500;
+        }
+        // Reserva para desserializacao, resposta HTTP e latencia de rede.
+        long margin = Math.max(25L, timeout / 5L);
+        long configured = Math.max(0L, Long.getLong("snake.budget.ms", DEFAULT_BUDGET_MS));
+        return Math.min(configured, Math.max(0L, timeout - margin)) * 1_000_000L;
+    }
+
     // =========================================================
     // GEOMETRIA DO TABULEIRO
     // =========================================================
 
     /** Tabela de vizinhos pre-calculada. Celula = y * largura + x. */
-    private static final class Geo {
+    static final class Geo {
 
         final int w;
         final int h;
@@ -144,7 +157,9 @@ public class Logic {
         }
 
         int manhattan(int a, int b) {
-            return Math.abs(a % w - b % w) + Math.abs(a / w - b / w);
+            int dx = Math.abs(a % w - b % w);
+            int dy = Math.abs(a / w - b / w);
+            return dx + dy;
         }
     }
 
@@ -153,7 +168,7 @@ public class Logic {
     // =========================================================
 
     /** Cobra imutavel. body[0] e a cabeca. Segmentos empilhados aparecem repetidos. */
-    private static final class Snk {
+    static final class Snk {
 
         final int[] body;
         final int health;
@@ -167,14 +182,14 @@ public class Logic {
     }
 
     /** Estado imutavel. snakes[0] e sempre a nossa cobra. */
-    private static final class World {
+    static final class World {
 
         final Geo geo;
-        final boolean[] hazard;
+        final int[] hazard;
         final boolean[] food;
         final Snk[] snakes;
 
-        World(Geo geo, boolean[] hazard, boolean[] food, Snk[] snakes) {
+        World(Geo geo, int[] hazard, boolean[] food, Snk[] snakes) {
             this.geo = geo;
             this.hazard = hazard;
             this.food = food;
@@ -182,7 +197,7 @@ public class Logic {
         }
     }
 
-    private static World buildWorld(GameState state) {
+    static World buildWorld(GameState state) {
 
         if (state == null || state.getBoard() == null || state.getYou() == null) {
             return null;
@@ -191,6 +206,9 @@ public class Logic {
         int w = state.getBoard().getWidth();
         int h = state.getBoard().getHeight();
 
+        if (w <= 0 || h <= 0 || (long) w * h > 100_000) {
+            return null;
+        }
         Geo geo = new Geo(w, h);
 
         Snake you = state.getYou();
@@ -223,15 +241,26 @@ public class Logic {
         }
 
         boolean[] food = new boolean[geo.cells];
-        boolean[] hazard = new boolean[geo.cells];
+        int[] hazard = new int[geo.cells];
 
         mark(geo, state.getBoard().getFood(), food);
-        mark(geo, state.getBoard().getHazards(), hazard);
+        List<Coordinate> hazards = state.getBoard().getHazards();
+        if (hazards != null) {
+            for (Coordinate c : hazards) {
+                if (valid(geo, c)) {
+                    hazard[c.getY() * w + c.getX()]++;
+                }
+            }
+        }
 
         return new World(geo, hazard, food, all.toArray(new Snk[0]));
     }
 
     private static boolean isSameSnake(Snake you, Snake other) {
+
+        if (other == null || you == other) {
+            return true;
+        }
 
         if (you.getId() != null && you.getId().equals(other.getId())) {
             return true;
@@ -244,13 +273,17 @@ public class Logic {
             Coordinate a = you.getBody().get(0);
             Coordinate b = other.getBody().get(0);
 
-            return a.getX() == b.getX() && a.getY() == b.getY();
+            return a != null && b != null && a.getX() == b.getX() && a.getY() == b.getY();
         }
 
         return false;
     }
 
     private static Snk toSnk(Geo geo, Snake snake) {
+
+        if (snake == null || snake.getHealth() <= 0) {
+            return null;
+        }
 
         List<Coordinate> body = snake.getBody();
 
@@ -264,8 +297,7 @@ public class Logic {
 
             Coordinate c = body.get(i);
 
-            if (c.getX() < 0 || c.getY() < 0
-                || c.getX() >= geo.w || c.getY() >= geo.h) {
+            if (!valid(geo, c)) {
                 return null;
             }
 
@@ -283,19 +315,23 @@ public class Logic {
 
         for (Coordinate c : list) {
 
-            if (c.getX() >= 0 && c.getY() >= 0
-                && c.getX() < geo.w && c.getY() < geo.h) {
+            if (valid(geo, c)) {
 
                 target[c.getY() * geo.w + c.getX()] = true;
             }
         }
     }
 
+    private static boolean valid(Geo geo, Coordinate c) {
+        return c != null && c.getX() >= 0 && c.getY() >= 0
+            && c.getX() < geo.w && c.getY() < geo.h;
+    }
+
     // =========================================================
     // BUSCA
     // =========================================================
 
-    private static final class Search {
+    static final class Search {
 
         final Geo geo;
         final World root;
@@ -306,22 +342,45 @@ public class Logic {
         final int[] release;
         final int[][] dist;
         final int[] queue;
+        final boolean[] seen;
+        final int[] foodCost;
+        final int[] foodTurns;
+        final PriorityQueue<Path> paths = new PriorityQueue<>();
+
+        // Tabela por jogada: guarda somente uma sugestao de movimento.
+        // Reutiliza apenas a ordem; valores e podas sao sempre calculados novamente.
+        private static final int ORDER_TABLE_SIZE = 8192;
+        final boolean useOrderTable;
+        final long[] orderKeys;
+        final int[] orderHints;
 
         boolean timeUp;
         long nodes;
+        int completedDepth;
 
         int[] rootOrder;
         int rootBestMove;
 
         Search(World root, long deadline) {
+            this(root, deadline, true);
+        }
+
+        Search(World root, long deadline, boolean useOrderTable) {
             this.geo = root.geo;
             this.root = root;
             this.deadline = deadline;
             this.hadOpponents = root.snakes.length > 1;
+            this.useOrderTable = useOrderTable;
+            this.orderKeys = new long[useOrderTable ? ORDER_TABLE_SIZE : 0];
+            this.orderHints = new int[useOrderTable ? ORDER_TABLE_SIZE : 0];
+            Arrays.fill(orderHints, -1);
 
             this.release = new int[geo.cells];
             this.dist = new int[root.snakes.length][geo.cells];
             this.queue = new int[geo.cells];
+            this.seen = new boolean[geo.cells];
+            this.foodCost = new int[geo.cells];
+            this.foodTurns = new int[geo.cells];
         }
 
         // -----------------------------------------------------
@@ -336,9 +395,11 @@ public class Logic {
                 return candidates[0];
             }
 
-            rootOrder = candidates;
+            rootOrder = orderMoves(root, 0, candidates, computeRelease(root));
 
-            int best = candidates[0];
+            // Avalia todos os candidatos antes da busca: timeout nao vira "up".
+            int best = fallbackMove(root);
+            moveToFront(best);
 
             for (int depth = 1; depth <= MAX_DEPTH; depth++) {
 
@@ -349,6 +410,7 @@ public class Logic {
                 if (timeUp) {
                     break;
                 }
+                completedDepth = depth;
 
                 if (rootBestMove >= 0) {
                     best = rootBestMove;
@@ -365,19 +427,45 @@ public class Logic {
         }
 
         void moveToFront(int move) {
+            promote(rootOrder, move);
+        }
 
-            int[] order = new int[rootOrder.length];
-            int c = 0;
-
-            order[c++] = move;
-
-            for (int m : rootOrder) {
-                if (m != move) {
-                    order[c++] = m;
+        void promote(int[] moves, int preferred) {
+            for (int i = 1; i < moves.length; i++) {
+                if (moves[i] == preferred) {
+                    System.arraycopy(moves, 0, moves, 1, i);
+                    moves[0] = preferred;
+                    return;
                 }
             }
+        }
 
-            rootOrder = order;
+        /** Chave da posicao: inclui vida, ordem do corpo, cobras vivas e comida. */
+        long positionKey(World s) {
+            long key = 0xcbf29ce484222325L;
+            for (int i = 0; i < s.snakes.length; i++) {
+                Snk snake = s.snakes[i];
+                key = (key ^ (i + 1L)) * 0x100000001b3L;
+                key = (key ^ (snake.alive ? 1L : 0L)) * 0x100000001b3L;
+                if (!snake.alive) {
+                    continue;
+                }
+                key = (key ^ snake.health) * 0x100000001b3L;
+                key = (key ^ snake.body.length) * 0x100000001b3L;
+                for (int cell : snake.body) {
+                    key = (key ^ (cell + 1L)) * 0x100000001b3L;
+                }
+            }
+            key = (key ^ -1L) * 0x100000001b3L;
+            for (int cell = 0; cell < geo.cells; cell++) {
+                if (s.food[cell]) {
+                    key = (key ^ (cell + 1L)) * 0x100000001b3L;
+                }
+            }
+            // Geometria e hazards sao constantes dentro desta Search.
+            key ^= key >>> 33;
+            key *= 0xff51afd7ed558ccdL;
+            return key ^ (key >>> 33);
         }
 
         // -----------------------------------------------------
@@ -389,14 +477,11 @@ public class Logic {
 
         int value(World s, int depth, int alpha, int beta, boolean isRoot) {
 
-            if (timeUp) {
+            if (expired()) {
                 return 0;
             }
 
-            if ((++nodes & 127L) == 0 && System.nanoTime() >= deadline) {
-                timeUp = true;
-                return 0;
-            }
+            nodes++;
 
             int n = s.snakes.length;
 
@@ -422,7 +507,14 @@ public class Logic {
 
             int[] rel = computeRelease(s);
 
-            int[] myMoves = isRoot ? rootOrder : legalMoves(s, 0, rel);
+            int[] myMoves = isRoot ? rootOrder : orderMoves(s, 0, legalMoves(s, 0, rel), rel);
+
+            long tableKey = useOrderTable ? positionKey(s) : 0L;
+            int slot = (int) tableKey & (ORDER_TABLE_SIZE - 1);
+            if (useOrderTable && orderHints[slot] >= 0 && orderKeys[slot] == tableKey) {
+                // A sugestao so e aplicada se continuar entre os movimentos legais.
+                promote(myMoves, orderHints[slot]);
+            }
 
             // Inimigos ordenados por proximidade da nossa cabeca.
             int[] order = new int[alive];
@@ -452,7 +544,7 @@ public class Logic {
                 order[b + 1] = key;
             }
 
-            int k = Math.min(alive, FULL_BRANCH_OPPONENTS);
+            int k = fullOpponentCount(s, order);
 
             int[] fullIdx = new int[k];
             int[][] fullMoves = new int[k][];
@@ -466,13 +558,14 @@ public class Logic {
 
                 if (j < k) {
                     fullIdx[j] = snakeIndex;
-                    fullMoves[j] = legalMoves(s, snakeIndex, rel);
+                    fullMoves[j] = orderMoves(s, snakeIndex, legalMoves(s, snakeIndex, rel), rel);
                 } else {
                     mv[snakeIndex] = heuristicMove(s, snakeIndex, rel);
                 }
             }
 
             int best = -INF;
+            int bestMove = -1;
             int[] pos = new int[k];
 
             for (int m : myMoves) {
@@ -484,6 +577,10 @@ public class Logic {
                 int cur = INF;
 
                 while (true) {
+
+                    if (expired()) {
+                        return 0;
+                    }
 
                     for (int j = 0; j < k; j++) {
                         mv[fullIdx[j]] = fullMoves[j][pos[j]];
@@ -528,6 +625,7 @@ public class Logic {
                 if (cur > best) {
 
                     best = cur;
+                    bestMove = m;
 
                     if (isRoot) {
                         rootBestMove = m;
@@ -543,7 +641,32 @@ public class Logic {
                 }
             }
 
+            if (useOrderTable && bestMove >= 0) {
+                orderKeys[slot] = tableKey;
+                orderHints[slot] = bestMove;
+            }
             return best;
+        }
+
+        /**
+         * Preserva a busca dos dois inimigos mais proximos. A distancia entre
+         * cabecas nao basta para descartar a influencia de corpos longos.
+         * Todas as ameacas a ate duas casas tambem sao ramificadas.
+         */
+        int fullOpponentCount(World s, int[] order) {
+            int count = Math.min(order.length, FULL_BRANCH_OPPONENTS);
+            while (count < order.length
+                && geo.manhattan(s.snakes[order[count]].body[0], s.snakes[0].body[0]) <= 2) {
+                count++;
+            }
+            return count;
+        }
+
+        boolean expired() {
+            if (timeUp || System.nanoTime() - deadline >= 0) {
+                timeUp = true;
+            }
+            return timeUp;
         }
 
         // -----------------------------------------------------
@@ -598,51 +721,123 @@ public class Logic {
             return Arrays.copyOf(result, c);
         }
 
-        /** Movimento unico e barato para inimigos distantes (nao ramificados). */
-        int heuristicMove(World s, int i, int[] rel) {
+        int healthAfterMove(World s, Snk snake, int next) {
+            if (next < 0) {
+                return 0;
+            }
+            return s.food[next] ? 100
+                : snake.health - 1 - s.hazard[next] * HAZARD_DAMAGE;
+        }
 
-            int[] legal = legalMoves(s, i, rel);
-
-            Snk snake = s.snakes[i];
-            int head = snake.body[0];
-
-            int bestDir = legal[0];
-            int bestScore = Integer.MIN_VALUE;
-
-            for (int d : legal) {
-
-                int next = geo.nbr[head][d];
-
-                if (next < 0) {
+        /** Risco de perder um head-to-head, inclusive contra inimigos nao ramificados. */
+        int headRisk(World s, int i, int next, int[] rel) {
+            Snk me = s.snakes[i];
+            int risk = 0;
+            for (int j = 0; j < s.snakes.length; j++) {
+                Snk other = s.snakes[j];
+                if (j == i || !other.alive || other.body.length < me.body.length
+                    || healthAfterMove(s, other, next) <= 0) {
                     continue;
                 }
-
-                int score = 0;
-
-                for (int e = 0; e < 4; e++) {
-
-                    int around = geo.nbr[next][e];
-
-                    if (around >= 0 && rel[around] <= 1) {
-                        score += 10;
+                for (int d : legalMoves(s, j, rel)) {
+                    if (geo.nbr[other.body[0]][d] == next) {
+                        risk++;
+                        break;
                     }
                 }
+            }
+            return risk;
+        }
 
-                if (s.food[next]) {
-                    score += snake.health < 50 ? 25 : 8;
-                }
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestDir = d;
+        int moveScore(World s, int i, int d, int[] rel) {
+            Snk snake = s.snakes[i];
+            int next = geo.nbr[snake.body[0]][d];
+            if (next < 0 || rel[next] > 1) {
+                return LOSS;
+            }
+            int hp = healthAfterMove(s, snake, next);
+            if (hp <= 0) {
+                return LOSS + hp;
+            }
+            int score = -20_000 * headRisk(s, i, next, rel);
+            int exits = 0;
+            for (int around : geo.nbr[next]) {
+                if (around >= 0 && around != snake.body[0] && rel[around] <= 2) {
+                    exits++;
                 }
             }
+            score += 70 * exits + hp - 8 * s.hazard[next] * HAZARD_DAMAGE;
+            int nearest = UNREACHABLE;
+            for (int cell = 0; cell < geo.cells; cell++) {
+                if (s.food[cell]) {
+                    nearest = Math.min(nearest, geo.manhattan(next, cell));
+                }
+            }
+            if (nearest < UNREACHABLE) {
+                score -= (snake.health < 40 ? 12 : 2) * nearest;
+            }
+            if (s.food[next]) {
+                score += snake.health < 40 ? 600 : 90;
+            }
+            return score;
+        }
 
-            return bestDir;
+        int[] orderMoves(World s, int i, int[] moves, int[] rel) {
+            int[] scores = new int[moves.length];
+            for (int a = 0; a < moves.length; a++) {
+                scores[a] = moveScore(s, i, moves[a], rel);
+            }
+            for (int a = 1; a < moves.length; a++) {
+                int move = moves[a];
+                int score = scores[a];
+                int b = a - 1;
+                while (b >= 0 && scores[b] < score) {
+                    moves[b + 1] = moves[b];
+                    scores[b + 1] = scores[b];
+                    b--;
+                }
+                moves[b + 1] = move;
+                scores[b + 1] = score;
+            }
+            return moves;
+        }
+
+        /** Decisao de emergencia completa, mesmo com budget zero ou busca interrompida. */
+        int fallbackMove(World s) {
+            int[] rel = computeRelease(s).clone();
+            int[] candidates = legalMoves(s, 0, rel);
+            int[] moves = new int[s.snakes.length];
+            Arrays.fill(moves, -1);
+            for (int i = 1; i < s.snakes.length; i++) {
+                if (s.snakes[i].alive) {
+                    moves[i] = heuristicMove(s, i, rel);
+                }
+            }
+            int bestMove = candidates[0];
+            int bestScore = Integer.MIN_VALUE;
+            for (int candidate : candidates) {
+                int next = geo.nbr[s.snakes[0].body[0]][candidate];
+                moves[0] = candidate;
+                World child = step(s, moves);
+                int score = child.snakes[0].alive ? eval(child) : LOSS;
+                if (next >= 0) {
+                    score -= 20_000 * headRisk(s, 0, next, rel);
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMove = candidate;
+                }
+            }
+            return bestMove;
+        }
+
+        /** Movimento unico e barato para inimigos distantes (nao ramificados). */
+        int heuristicMove(World s, int i, int[] rel) {
+            return orderMoves(s, i, legalMoves(s, i, rel), rel)[0];
         }
 
         // -----------------------------------------------------
-        // Simulacao exata de um turno
+        // Simulacao de um turno (Standard e hazards ja conhecidos).
         // Ordem oficial: mover, reduzir vida, hazard, comer, eliminar.
         // -----------------------------------------------------
 
@@ -684,13 +879,10 @@ public class Logic {
                 System.arraycopy(sn.body, 0, nb, 1, len - 1);
                 body[i] = nb;
 
-                int hp = sn.health - 1;
+                int hp = healthAfterMove(s, sn, next);
 
                 if (s.food[next]) {
                     ate[i] = true;
-                    hp = 100;
-                } else if (s.hazard[next]) {
-                    hp -= HAZARD_DAMAGE;
                 }
 
                 health[i] = hp;
@@ -845,6 +1037,109 @@ public class Logic {
             }
         }
 
+        /** Area livre agora: complementa a BFS otimista que libera corpos no futuro. */
+        int immediateSpace(World s, int[] rel) {
+            Arrays.fill(seen, false);
+            int head = s.snakes[0].body[0];
+            int first = 0;
+            int last = 0;
+            seen[head] = true;
+            queue[last++] = head;
+            while (first < last) {
+                for (int next : geo.nbr[queue[first++]]) {
+                    if (next >= 0 && !seen[next] && rel[next] <= 1) {
+                        seen[next] = true;
+                        queue[last++] = next;
+                    }
+                }
+            }
+            return last;
+        }
+
+        private static final class Path implements Comparable<Path> {
+            final int cell;
+            final int cost;
+            final int turns;
+
+            Path(int cell, int cost, int turns) {
+                this.cell = cell;
+                this.cost = cost;
+                this.turns = turns;
+            }
+
+            @Override
+            public int compareTo(Path other) {
+                int comparison = Integer.compare(cost, other.cost);
+                return comparison != 0 ? comparison : Integer.compare(turns, other.turns);
+            }
+        }
+
+        /**
+         * Dijkstra por vida gasta ate a primeira comida. O ultimo passo permite
+         * comer com vida 1; comida no hazard tambem restaura a vida.
+         * Retorna {custo, turnos, disputa}. Este e um indicador, nao uma simulacao
+         * de trajetoria: liberacao futura de corpos continua sendo uma estimativa.
+         */
+        int[] bestFood(World s, int[] rel) {
+            Arrays.fill(foodCost, UNREACHABLE);
+            Arrays.fill(foodTurns, UNREACHABLE);
+            paths.clear();
+            Snk me = s.snakes[0];
+            int head = me.body[0];
+            foodCost[head] = 0;
+            foodTurns[head] = 0;
+            paths.add(new Path(head, 0, 0));
+            int[] best = {UNREACHABLE, UNREACHABLE, 0};
+            int bestScore = Integer.MAX_VALUE;
+            while (!paths.isEmpty()) {
+                Path path = paths.poll();
+                if (path.cost != foodCost[path.cell] || path.turns != foodTurns[path.cell]) {
+                    continue;
+                }
+                for (int next : geo.nbr[path.cell]) {
+                    int turns = path.turns + 1;
+                    if (next < 0 || rel[next] > turns) {
+                        continue;
+                    }
+                    int cost = path.cost + 1;
+                    if (s.food[next]) {
+                        if (cost > me.health) {
+                            continue;
+                        }
+                        int contested = 0;
+                        for (int i = 1; i < s.snakes.length; i++) {
+                            Snk other = s.snakes[i];
+                            if (!other.alive || dist[i][next] > other.health) {
+                                continue;
+                            }
+                            if (dist[i][next] < turns || (dist[i][next] == turns
+                                && other.body.length >= me.body.length)) {
+                                contested = 1;
+                                break;
+                            }
+                        }
+                        int score = cost + 30 * contested;
+                        if (score < bestScore || (score == bestScore && turns < best[1])) {
+                            bestScore = score;
+                            best = new int[] {cost, turns, contested};
+                        }
+                        continue;
+                    }
+                    cost += s.hazard[next] * HAZARD_DAMAGE;
+                    if (cost >= me.health) {
+                        continue;
+                    }
+                    if (cost < foodCost[next]
+                        || (cost == foodCost[next] && turns < foodTurns[next])) {
+                        foodCost[next] = cost;
+                        foodTurns[next] = turns;
+                        paths.add(new Path(next, cost, turns));
+                    }
+                }
+            }
+            return best;
+        }
+
         // -----------------------------------------------------
         // Avaliacao de uma posicao (do nosso ponto de vista)
         // -----------------------------------------------------
@@ -921,9 +1216,9 @@ public class Logic {
                 oppMaxLen = Math.max(oppMaxLen, s.snakes[i].body.length);
             }
 
-            // Espaco que consigo alcancar ignorando os inimigos.
+            // Espaco alcancavel estimando quando os corpos atuais ficam livres.
             int selfSpace = 0;
-            int foodDist = UNREACHABLE;
+            boolean hasFood = false;
 
             for (int c = 0; c < geo.cells; c++) {
 
@@ -935,10 +1230,15 @@ public class Logic {
 
                 selfSpace++;
 
-                if (s.food[c] && d < foodDist) {
-                    foodDist = d;
-                }
             }
+            for (boolean food : s.food) {
+                hasFood |= food;
+            }
+
+            int[] meal = hasFood ? bestFood(s, rel) : new int[] {UNREACHABLE, UNREACHABLE, 0};
+            int foodDist = meal[1];
+            int openSpace = immediateSpace(s, rel);
+            boolean tailAccessible = seen[me.body[myLen - 1]];
 
             int score = 0;
 
@@ -957,11 +1257,25 @@ public class Logic {
                 score -= 3000 + 300 * (myLen - selfSpace);
             }
 
-            // Fome: nao consegue chegar a nenhuma comida a tempo.
-            if (me.health < foodDist) {
-                score -= 25_000;
+            // Sem caminho para o rabo, depender de corpos futuros e arriscado.
+            if (openSpace < myLen + 2 && !tailAccessible) {
+                score -= 180 * (myLen + 2 - openSpace);
+            }
+            score += 4 * Math.min(openSpace, myLen * 3);
+            int mobility = 0;
+            for (int move : legalMoves(s, 0, rel)) {
+                int next = geo.nbr[me.body[0]][move];
+                if (next >= 0 && rel[next] <= 1 && healthAfterMove(s, me, next) > 0
+                    && headRisk(s, 0, next, rel) == 0) {
+                    mobility++;
+                }
+            }
+            score += 80 * mobility;
+            if (mobility == 0) {
+                score -= 4000;
             }
 
+            // Sem comida visivel, nao presume que nunca havera novos spawns.
             if (me.health < 35) {
                 score -= (35 - me.health) * 20;
             }
@@ -970,13 +1284,23 @@ public class Logic {
                 + (me.health < 60 ? (60 - me.health) / 4 : 0)
                 + (diff <= 0 ? 2 : 0);
 
-            score -= pull * Math.min(foodDist, 25);
+            if (hasFood && meal[0] < UNREACHABLE) {
+                score -= pull * Math.min(foodDist, 25);
+                score -= pull * Math.min(meal[0], 100);
+                score -= meal[2] * (me.health < 35 ? 500 : 150);
+            } else if (hasFood) {
+                // Comida inacessivel e um alerta, nao uma morte comprovada:
+                // a estimativa de trajetoria e aproximada e novas frutas podem surgir.
+                score -= 150 + (100 - me.health) * 5;
+            }
+            score += me.health / 5;
 
-            if (s.hazard[me.body[0]]) {
-                score -= 60;
+            if (s.hazard[me.body[0]] > 0) {
+                score -= 4 * HAZARD_DAMAGE * s.hazard[me.body[0]];
             }
 
-            return score;
+            // Resultado terminal sempre supera qualquer avaliacao heuristica.
+            return Math.max(LOSS / 2, Math.min(WIN / 2, score));
         }
     }
 }
