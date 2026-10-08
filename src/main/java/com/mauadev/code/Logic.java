@@ -21,8 +21,9 @@ import com.mauadev.code.entities.Snake;
  *     e poda alpha-beta) escolhe o movimento que da o melhor resultado no pior
  *     caso. Os dois inimigos mais proximos e todas as ameacas imediatas sao
  *     ramificados. Uma tabela local reutiliza apenas a ordem dos movimentos.
- *  3. Nas folhas, o estado e avaliado por territorio (Voronoi), espaco
- *     alcancavel, tamanho relativo, fome e distancia da comida.
+ *  3. Nas folhas, o estado e avaliado por territorio (Voronoi), camaras livres,
+ *     tamanho relativo, fome e comida. Uma verificacao temporal limitada da
+ *     raiz complementa as estimativas de espaco sem bloquear vitorias imediatas.
  *
  * Nao ha estado estatico mutavel: varias partidas podem ser jogadas em paralelo.
  * Comida futura e expansao aleatoria de hazards nao sao previstas na busca.
@@ -82,7 +83,8 @@ public class Logic {
 
     public static String getMove(GameState state) {
 
-        long deadline = System.nanoTime() + searchBudgetNanos(state);
+        long started = System.nanoTime();
+        long deadline = started + searchBudgetNanos(state);
         World world = null;
 
         try {
@@ -92,9 +94,25 @@ public class Logic {
                 return "up";
             }
 
-            return NAMES[new Search(world, deadline).run()];
+            Search search = new Search(world, deadline);
+            int move = search.run();
+            if (Boolean.getBoolean("snake.debug")) {
+                // Diagnostico opt-in: nao altera o JSON nem compartilha estado.
+                System.err.println("snake move=" + NAMES[move]
+                    + " turn=" + state.getTurn()
+                    + " depth=" + search.completedDepth + " nodes=" + search.nodes
+                    + " elapsedUs=" + (System.nanoTime() - started) / 1_000L
+                    + " fallback=" + search.usedFallback + " timeout=" + search.timeUp
+                    + " escapeNodes=" + search.escapeNodes
+                    + " trapPenalty=" + search.rootSafetyPenalty[move]);
+            }
+            return NAMES[move];
 
         } catch (RuntimeException e) {
+
+            if (Boolean.getBoolean("snake.debug")) {
+                System.err.println("snake fallback=exception type=" + e.getClass().getSimpleName());
+            }
 
             // Se a busca falhar, usa a mesma avaliacao de emergencia.
             try {
@@ -343,6 +361,7 @@ public class Logic {
         final int[][] dist;
         final int[] queue;
         final boolean[] seen;
+        final boolean[] headThreat;
         final int[] foodCost;
         final int[] foodTurns;
         final PriorityQueue<Path> paths = new PriorityQueue<>();
@@ -357,6 +376,14 @@ public class Logic {
         boolean timeUp;
         long nodes;
         int completedDepth;
+        boolean usedFallback;
+        int largestChamber;
+        long escapeNodes;
+        int probeVisited;
+        long probeDeadline;
+        private static final int ROOT_TRAP_PENALTY = 3_000;
+        private static final int ESCAPE_NODE_LIMIT = 256;
+        final int[] rootSafetyPenalty = new int[4];
 
         int[] rootOrder;
         int rootBestMove;
@@ -379,6 +406,7 @@ public class Logic {
             this.dist = new int[root.snakes.length][geo.cells];
             this.queue = new int[geo.cells];
             this.seen = new boolean[geo.cells];
+            this.headThreat = new boolean[geo.cells];
             this.foodCost = new int[geo.cells];
             this.foodTurns = new int[geo.cells];
         }
@@ -396,9 +424,11 @@ public class Logic {
             }
 
             rootOrder = orderMoves(root, 0, candidates, computeRelease(root));
+            prepareEscapeChecks(candidates);
 
             // Avalia todos os candidatos antes da busca: timeout nao vira "up".
             int best = fallbackMove(root);
+            usedFallback = true;
             moveToFront(best);
 
             for (int depth = 1; depth <= MAX_DEPTH; depth++) {
@@ -414,16 +444,100 @@ public class Logic {
 
                 if (rootBestMove >= 0) {
                     best = rootBestMove;
+                    usedFallback = false;
                     moveToFront(best);
                 }
 
                 // Vitoria forcada encontrada: nao ha o que melhorar.
-                if (value >= WIN) {
+                if (value >= WIN - ROOT_TRAP_PENALTY) {
                     break;
                 }
             }
 
             return best;
+        }
+
+        /**
+         * Prova limitada de beco criado pelo proprio corpo. Ignora inimigos e
+         * vida, portanto nao confunde fome futura ou uma possivel morte inimiga
+         * com aprisionamento. Uma interrupcao e inconclusiva, nunca "morte".
+         * Usa no maximo 10% do tempo restante; a busca adversarial vem depois.
+         */
+        void prepareEscapeChecks(int[] candidates) {
+            long now = System.nanoTime();
+            probeDeadline = now + Math.max(0L, (deadline - now) / 10L);
+            for (int move : candidates) {
+                if (System.nanoTime() >= probeDeadline) {
+                    break;
+                }
+                Snk me = root.snakes[0];
+                int next = geo.nbr[me.body[0]][move];
+                if (next < 0) {
+                    continue;
+                }
+                boolean[] food = root.food.clone();
+                int[] body = advanceOwnBody(me.body, next, food[next]);
+                if (body == null) {
+                    continue;
+                }
+                food[next] = false;
+                probeVisited = 0;
+                int horizon = Math.min(24, body.length + 2);
+                if (escapePath(body, food, horizon - 1) < 0) {
+                    rootSafetyPenalty[move] = ROOT_TRAP_PENALTY;
+                }
+            }
+        }
+
+        /** 1 = continuacao encontrada, 0 = inconclusivo, -1 = todas esgotadas. */
+        int escapePath(int[] body, boolean[] food, int remaining) {
+            if (remaining == 0) {
+                return 1;
+            }
+            if (probeVisited >= ESCAPE_NODE_LIMIT
+                || (probeVisited % 16 == 0 && System.nanoTime() >= probeDeadline)) {
+                return 0;
+            }
+            probeVisited++;
+            escapeNodes++;
+            boolean unknown = false;
+            for (int next : geo.nbr[body[0]]) {
+                if (next < 0) {
+                    continue;
+                }
+                boolean ate = food[next];
+                int[] moved = advanceOwnBody(body, next, ate);
+                if (moved == null) {
+                    continue;
+                }
+                if (ate) {
+                    food[next] = false;
+                }
+                int result = escapePath(moved, food, remaining - 1);
+                if (ate) {
+                    food[next] = true;
+                }
+                if (result > 0) {
+                    return 1;
+                }
+                unknown |= result == 0;
+            }
+            return unknown ? 0 : -1;
+        }
+
+        int[] advanceOwnBody(int[] body, int next, boolean ate) {
+            for (int i = 0; i < body.length - 1; i++) {
+                if (body[i] == next) {
+                    return null;
+                }
+            }
+            int[] moved = new int[body.length + (ate ? 1 : 0)];
+            moved[0] = next;
+            System.arraycopy(body, 0, moved, 1, body.length - 1);
+            if (ate) {
+                moved[body.length] = moved[body.length - 1];
+            }
+            return moved;
         }
 
         void moveToFront(int move) {
@@ -570,6 +684,12 @@ public class Logic {
 
             for (int m : myMoves) {
 
+                // O desconto e constante para esta escolha da raiz. Os limites
+                // precisam da mesma translacao para preservar a poda alpha-beta.
+                int rootPenalty = isRoot ? rootSafetyPenalty[m] : 0;
+                int branchAlpha = alpha + rootPenalty;
+                int branchBeta = beta + rootPenalty;
+
                 mv[0] = m;
 
                 Arrays.fill(pos, 0);
@@ -588,7 +708,8 @@ public class Logic {
 
                     World child = step(s, mv);
 
-                    int v = value(child, depth - 1, alpha, Math.min(beta, cur), false);
+                    int v = value(child, depth - 1, branchAlpha,
+                        Math.min(branchBeta, cur), false);
 
                     if (timeUp) {
                         return 0;
@@ -598,7 +719,7 @@ public class Logic {
                         cur = v;
                     }
 
-                    if (cur <= alpha) {
+                    if (cur <= branchAlpha) {
                         break;
                     }
 
@@ -622,6 +743,7 @@ public class Logic {
                     }
                 }
 
+                cur -= rootPenalty;
                 if (cur > best) {
 
                     best = cur;
@@ -820,6 +942,9 @@ public class Logic {
                 moves[0] = candidate;
                 World child = step(s, moves);
                 int score = child.snakes[0].alive ? eval(child) : LOSS;
+                if (s == root) {
+                    score -= rootSafetyPenalty[candidate];
+                }
                 if (next >= 0) {
                     score -= 20_000 * headRisk(s, 0, next, rel);
                 }
@@ -1037,23 +1162,53 @@ public class Logic {
             }
         }
 
-        /** Area livre agora: complementa a BFS otimista que libera corpos no futuro. */
+        /**
+         * Camaras livres sem atravessar a propria cabeca. Somar dois becos que
+         * so se conectam pela cabeca cria uma estimativa de espaco enganosa.
+         * Casas imediatamente disputadas com cabecas maiores/iguais nao
+         * servem de entrada. Depois do primeiro passo a cabeca inimiga pode
+         * sair, portanto essas casas nao viram paredes permanentes.
+         */
         int immediateSpace(World s, int[] rel) {
             Arrays.fill(seen, false);
-            int head = s.snakes[0].body[0];
-            int first = 0;
-            int last = 0;
-            seen[head] = true;
-            queue[last++] = head;
-            while (first < last) {
-                for (int next : geo.nbr[queue[first++]]) {
-                    if (next >= 0 && !seen[next] && rel[next] <= 1) {
-                        seen[next] = true;
-                        queue[last++] = next;
+            Arrays.fill(headThreat, false);
+            Snk me = s.snakes[0];
+            for (int i = 1; i < s.snakes.length; i++) {
+                Snk other = s.snakes[i];
+                if (!other.alive || other.body.length < me.body.length) {
+                    continue;
+                }
+                for (int move : legalMoves(s, i, rel)) {
+                    int next = geo.nbr[other.body[0]][move];
+                    if (next >= 0 && healthAfterMove(s, other, next) > 0) {
+                        headThreat[next] = true;
                     }
                 }
             }
-            return last;
+            int head = s.snakes[0].body[0];
+            seen[head] = true;
+            int total = 1;
+            largestChamber = 1;
+            for (int entry : geo.nbr[head]) {
+                if (entry < 0 || seen[entry] || rel[entry] > 1 || headThreat[entry]) {
+                    continue;
+                }
+                int first = 0;
+                int last = 0;
+                seen[entry] = true;
+                queue[last++] = entry;
+                while (first < last) {
+                    for (int next : geo.nbr[queue[first++]]) {
+                        if (next >= 0 && !seen[next] && rel[next] <= 1) {
+                            seen[next] = true;
+                            queue[last++] = next;
+                        }
+                    }
+                }
+                total += last;
+                largestChamber = Math.max(largestChamber, last + 1);
+            }
+            return total;
         }
 
         private static final class Path implements Comparable<Path> {
@@ -1237,7 +1392,7 @@ public class Logic {
 
             int[] meal = hasFood ? bestFood(s, rel) : new int[] {UNREACHABLE, UNREACHABLE, 0};
             int foodDist = meal[1];
-            int openSpace = immediateSpace(s, rel);
+            immediateSpace(s, rel);
             boolean tailAccessible = seen[me.body[myLen - 1]];
 
             int score = 0;
@@ -1251,6 +1406,10 @@ public class Logic {
                 : Math.max(-4, Math.min(4, myLen - oppMaxLen));
 
             score += 25 * diff + 6 * myLen;
+            // Uma grande desvantagem continua relevante alem do limite +/-4,
+            // mas nao deve dominar a seguranca por causa de um inimigo gigante.
+            int deficit = Math.max(0, oppMaxLen - myLen);
+            score -= 4 * Math.min(20, Math.max(0, deficit - 4));
 
             // Armadilha: regiao menor que o proprio corpo.
             if (selfSpace < myLen) {
@@ -1258,10 +1417,10 @@ public class Logic {
             }
 
             // Sem caminho para o rabo, depender de corpos futuros e arriscado.
-            if (openSpace < myLen + 2 && !tailAccessible) {
-                score -= 180 * (myLen + 2 - openSpace);
+            if (largestChamber < myLen + 2 && !tailAccessible) {
+                score -= 180 * (myLen + 2 - largestChamber);
             }
-            score += 4 * Math.min(openSpace, myLen * 3);
+            score += 4 * Math.min(largestChamber, myLen * 3);
             int mobility = 0;
             for (int move : legalMoves(s, 0, rel)) {
                 int next = geo.nbr[me.body[0]][move];
@@ -1283,6 +1442,13 @@ public class Logic {
             int pull = 2
                 + (me.health < 60 ? (60 - me.health) / 4 : 0)
                 + (diff <= 0 ? 2 : 0);
+
+            // Crescer antes de ficar com fome, somente com margem de espaco
+            // e comida sem disputa conhecida. Comer tambem pode fechar a saida.
+            if (oppMaxLen > 0 && myLen <= oppMaxLen && me.health >= 60 && meal[2] == 0
+                && (largestChamber >= myLen + 3 || tailAccessible)) {
+                pull += 6 + Math.min(6, deficit / 3);
+            }
 
             if (hasFood && meal[0] < UNREACHABLE) {
                 score -= pull * Math.min(foodDist, 25);
